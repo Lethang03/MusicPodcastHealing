@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Home, Library, Search, Heart, ListMusic, History, LogOut, Play, Pause,
   SkipBack, SkipForward, Volume2, Moon, Sun, Plus, Clock3, Bookmark,
@@ -19,6 +19,7 @@ function fmt(sec=0){
 function readLocal(){try{return JSON.parse(localStorage.getItem(STORAGE_KEY)||'{}')}catch{return {}}}
 function writeLocal(v){localStorage.setItem(STORAGE_KEY,JSON.stringify(v))}
 function localDateKey(value=new Date()){const d=value instanceof Date?value:new Date(value);if(Number.isNaN(d.getTime()))return '';return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`}
+function useEscapeClose(close){useEffect(()=>{const handler=e=>{if(e.key==='Escape')close()};window.addEventListener('keydown',handler);return()=>window.removeEventListener('keydown',handler)},[close])}
 const titleFor=p=>({home:'Podcast',music:'Âm nhạc',musicDetail:'Chi tiết bài hát',search:'Tìm kiếm Podcast',library:'Thư viện Podcast',podcastDetail:'Chi tiết Podcast',favorites:'Podcast yêu thích',playlists:'Playlist Podcast',history:'Lịch sử Podcast',stats:'Thống kê nghe',profile:'Hồ sơ',podcastStudio:'Podcast Studio',musicStudio:'Music Studio'})[p]||'Podcast Vault'
 
 export default function App(){
@@ -54,6 +55,7 @@ export default function App(){
   const [selectedTrackId,setSelectedTrackId]=useState(null)
   const [listeningEvents,setListeningEvents]=useState([])
   const [playRequest,setPlayRequest]=useState(0)
+  const deferredQuery=useDeferredValue(query)
 
   const podcastById=useMemo(()=>Object.fromEntries((podcasts||[]).filter(Boolean).map(p=>[p.id,p])),[podcasts])
   const current=(episodes||[]).find(e=>e.id===currentId)||null
@@ -70,6 +72,10 @@ export default function App(){
   useEffect(() => {
     document.documentElement.dataset.theme = theme
   }, [theme])
+  useEffect(()=>{
+    const behavior=window.matchMedia('(prefers-reduced-motion: reduce)').matches?'auto':'smooth'
+    window.scrollTo({top:0,behavior})
+  },[page])
   useEffect(()=>{
     const on=()=>setOnline(true), off=()=>setOnline(false)
     window.addEventListener('online',on);window.addEventListener('offline',off)
@@ -208,8 +214,12 @@ export default function App(){
   }
 
   const menu=[['home',Headphones,'Podcast'],['music',Music2,'Âm nhạc'],['library',Library,'Thư viện'],['playlists',ListMusic,'Playlist'],['profile',UserRound,'Hồ sơ']]
-  const continueList=Object.values(progress).filter(p=>!p.completed&&p.current_time>10).sort((a,b)=>new Date(b.last_listened_at).getTime()-new Date(a.last_listened_at).getTime()).map(p=>episodes.find(e=>e.id===p.episode_id)).filter(Boolean)
-  const filtered=episodes.filter(e=>{const p=podcastById[e.podcast_id];return`${e.title} ${e.description||''} ${p?.title||''} ${p?.author||''}`.toLowerCase().includes(query.toLowerCase())})
+  const continueList=useMemo(()=>Object.values(progress).filter(p=>!p.completed&&p.current_time>10).sort((a,b)=>new Date(b.last_listened_at).getTime()-new Date(a.last_listened_at).getTime()).map(p=>episodes.find(e=>e.id===p.episode_id)).filter(Boolean),[progress,episodes])
+  const filtered=useMemo(()=>{
+    const needle=deferredQuery.trim().toLocaleLowerCase('vi')
+    if(!needle)return episodes
+    return episodes.filter(e=>{const p=podcastById[e.podcast_id];return`${e.title} ${e.description||''} ${p?.title||''} ${p?.author||''}`.toLocaleLowerCase('vi').includes(needle)})
+  },[episodes,podcastById,deferredQuery])
 
   const stats=useMemo(()=>{
     const totalSeconds=listeningEvents.reduce((sum,e)=>sum+Math.max(0,Number(e.listened_seconds)||0),0)
@@ -364,25 +374,27 @@ export default function App(){
           <input value={query} onChange={e=>setQuery(e.target.value)} onFocus={()=>setPage('search')} placeholder="Tìm podcast, tập..."/>
         </div>
         <div className="topbar-actions">
-          <button className="top-icon-btn" title="Thông báo"><Bell size={19}/><i/></button>
+          <button className="top-icon-btn" title="Thông báo" aria-label="Thông báo" onClick={()=>setToast('Bạn chưa có thông báo mới.')}><Bell size={19}/><i/></button>
           <button className="avatar-btn" onClick={()=>setPage('profile')}><span>{(profile?.display_name||session?.user?.email||'P')[0].toUpperCase()}</span></button>
         </div>
       </header>
-      {page!=='library'&&page!=='podcastDetail'&&page!=='musicDetail'&&<div className="page-title-row"><div><div className="eyebrow">PODCAST VAULT</div><h1>{titleFor(page)}</h1></div></div>}
+      <div className="page-content" key={page}>
+        {page!=='library'&&page!=='podcastDetail'&&page!=='musicDetail'&&<div className="page-title-row"><div><div className="eyebrow">PODCAST VAULT</div><h1>{titleFor(page)}</h1></div></div>}
 
-      {page==='home'&&<HomePage podcasts={podcasts} episodes={episodes} progress={progress} continueList={continueList} podcastById={podcastById} onPlay={playEpisode} favorites={favorites} onFav={toggleFav} setPage={setPage} loading={loadingLibrary}/>}
-      {page==='music'&&<MusicPage tracks={tracks} onPlay={playTrack} onOpen={openTrack} currentTrackId={currentTrackId} activePlayer={activePlayer}/>}
-      {page==='musicDetail'&&<MusicDetailPage track={tracks.find(t=>t.id===selectedTrackId)} onPlay={playTrack} onBack={()=>setPage('music')} active={activePlayer==='music'&&currentTrackId===selectedTrackId}/>}
-      {page==='search'&&<SearchPage query={query} setQuery={setQuery} episodes={filtered} podcastById={podcastById} onPlay={playEpisode} favorites={favorites} onFav={toggleFav}/>}
-      {page==='library'&&<LibraryPage podcasts={podcasts} episodes={episodes} progress={progress} onPlay={playEpisode} onOpen={openPodcast}/>}
-      {page==='podcastDetail'&&<PodcastDetailPage podcast={podcastById[selectedPodcastId]} episodes={episodes.filter(e=>e.podcast_id===selectedPodcastId)} onPlay={playEpisode} onBack={()=>setPage('library')} favorites={favorites} onFav={toggleFav}/>}
-      {page==='favorites'&&<EpisodeList title="Tập đã lưu" episodes={episodes.filter(e=>favorites.includes(e.id))} podcastById={podcastById} onPlay={playEpisode} favorites={favorites} onFav={toggleFav}/>}
-      {page==='history'&&<HistoryPage history={history} episodes={episodes} podcastById={podcastById} onPlay={playEpisode}/>}
-      {page==='playlists'&&<PlaylistPage playlists={playlists} setPlaylists={setPlaylists} episodes={episodes} podcastById={podcastById} onPlay={playEpisode} session={session}/>}
-      {page==='stats'&&<StatsPage stats={stats} podcastById={podcastById}/>}
-      {page==='profile'&&<ProfilePage profile={profile} session={session} setProfile={setProfile} stats={stats} podcastById={podcastById}/>}
-      {page==='podcastStudio'&&canCreate&&<CreatorStudio onPublished={loadPublicLibrary} profile={profile}/>}
-      {page==='musicStudio'&&canCreate&&<MusicStudio onPublished={loadPublicLibrary} profile={profile}/>}
+        {page==='home'&&<HomePage podcasts={podcasts} episodes={episodes} progress={progress} continueList={continueList} podcastById={podcastById} onPlay={playEpisode} favorites={favorites} onFav={toggleFav} setPage={setPage} loading={loadingLibrary}/>}
+        {page==='music'&&<MusicPage tracks={tracks} onPlay={playTrack} onOpen={openTrack} currentTrackId={currentTrackId} activePlayer={activePlayer} loading={loadingLibrary}/>}
+        {page==='musicDetail'&&<MusicDetailPage track={tracks.find(t=>t.id===selectedTrackId)} onPlay={playTrack} onBack={()=>setPage('music')} active={activePlayer==='music'&&currentTrackId===selectedTrackId}/>}
+        {page==='search'&&<SearchPage query={query} setQuery={setQuery} episodes={filtered} podcastById={podcastById} onPlay={playEpisode} favorites={favorites} onFav={toggleFav}/>}
+        {page==='library'&&<LibraryPage podcasts={podcasts} episodes={episodes} progress={progress} onPlay={playEpisode} onOpen={openPodcast} loading={loadingLibrary}/>}
+        {page==='podcastDetail'&&<PodcastDetailPage podcast={podcastById[selectedPodcastId]} episodes={episodes.filter(e=>e.podcast_id===selectedPodcastId)} onPlay={playEpisode} onBack={()=>setPage('library')} favorites={favorites} onFav={toggleFav}/>}
+        {page==='favorites'&&<EpisodeList title="Tập đã lưu" episodes={episodes.filter(e=>favorites.includes(e.id))} podcastById={podcastById} onPlay={playEpisode} favorites={favorites} onFav={toggleFav}/>}
+        {page==='history'&&<HistoryPage history={history} episodes={episodes} podcastById={podcastById} onPlay={playEpisode}/>}
+        {page==='playlists'&&<PlaylistPage playlists={playlists} setPlaylists={setPlaylists} episodes={episodes} podcastById={podcastById} onPlay={playEpisode} session={session}/>}
+        {page==='stats'&&<StatsPage stats={stats} podcastById={podcastById}/>}
+        {page==='profile'&&<ProfilePage profile={profile} session={session} setProfile={setProfile} stats={stats} podcastById={podcastById}/>}
+        {page==='podcastStudio'&&canCreate&&<CreatorStudio onPublished={loadPublicLibrary} profile={profile}/>}
+        {page==='musicStudio'&&canCreate&&<MusicStudio onPublished={loadPublicLibrary} profile={profile}/>}
+      </div>
     </main>
 
     <UnifiedPlayer
@@ -422,14 +434,15 @@ function HomePage({podcasts,episodes,progress,continueList,podcastById,onPlay,fa
       <div className="continue-grid">{continueList.slice(0,4).map(e=>{const p=progress[e.id]||{},pod=podcastById[e.podcast_id];return <button className="continue-card" key={e.id} onClick={()=>onPlay(e.id)}>
         <img loading="lazy" decoding="async" src={pod?.image||pod?.cover_url} alt=""/><div><small>{pod?.title}</small><strong>{e.title}</strong><span>{fmt(p.current_time)} / {fmt(p.duration||e.duration)}</span><div className="progress"><i style={{width:`${p.progress_percent||0}%`}}/></div></div><Play className="round-play" size={18} fill="currentColor"/></button>})}</div></section>}
 
-    <section><div className="section-head"><div><span>{loading?'Đang tải':'Thư viện của bạn'}</span><h3>Podcast nổi bật</h3></div></div><div className="podcast-grid">{podcasts.map(p=><article className="podcast-card" key={p.id}>
+    <section><div className="section-head"><div><span>{loading?'Đang tải':'Thư viện của bạn'}</span><h3>Podcast nổi bật</h3></div></div>{loading?<LoadingCards/>:<div className="podcast-grid">{podcasts.map(p=><article className="podcast-card" key={p.id}>
       <div className="cover-wrap"><img loading="lazy" decoding="async" src={p.image||p.cover_url} alt={p.title}/><button onClick={()=>onPlay(episodes.find(e=>e.podcast_id===p.id)?.id)}><Play fill="currentColor"/></button></div>
-      <small>{p.category||'Podcast'}</small><h4>{p.title}</h4><p>{p.description}</p></article>)}</div></section>
-    <EpisodeList title="Tập mới nhất" episodes={episodes} podcastById={podcastById} onPlay={onPlay} favorites={favorites} onFav={onFav}/>
+      <small>{p.category||'Podcast'}</small><h4>{p.title}</h4><p>{p.description}</p></article>)}</div>}</section>
+    {!loading&&<EpisodeList title="Tập mới nhất" episodes={episodes} podcastById={podcastById} onPlay={onPlay} favorites={favorites} onFav={onFav}/>}
   </div>
 }
+function LoadingCards({count=6}){return <div className="podcast-grid loading-grid" aria-label="Đang tải thư viện">{Array.from({length:count},(_,i)=><div className="skeleton-card" key={i}><span className="skeleton skeleton-cover"/><span className="skeleton skeleton-line short"/><span className="skeleton skeleton-line"/><span className="skeleton skeleton-line medium"/></div>)}</div>}
 function SearchPage({query,setQuery,episodes,podcastById,onPlay,favorites,onFav}){return <div className="page-stack"><div className="searchbox"><Search size={20}/><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Tìm tên podcast, tập, chủ đề..."/></div><EpisodeList title={query?`Kết quả cho “${query}”`:'Tất cả tập'} episodes={episodes} podcastById={podcastById} onPlay={onPlay} favorites={favorites} onFav={onFav}/></div>}
-function LibraryPage({podcasts=[],episodes=[],progress={},onPlay,onOpen}){
+function LibraryPage({podcasts=[],episodes=[],progress={},onPlay,onOpen,loading=false}){
   const [filter,setFilter]=useState('all')
   const [view,setView]=useState('grid')
 
@@ -461,7 +474,7 @@ function LibraryPage({podcasts=[],episodes=[],progress={},onPlay,onOpen}){
       <button className={filter==='completed'?'active':''} onClick={()=>setFilter('completed')}>Đã hoàn thành</button>
     </div>
 
-    <div className={`reference-podcast-grid ${view==='list'?'list-view':''}`}>
+    {loading?<LoadingCards count={4}/>:<div className={`reference-podcast-grid ${view==='list'?'list-view':''}`}>
       {visible.length?visible.map(p=>{
         const first=p.eps.find(e=>!progress[e.id]?.completed)||p.eps[0]
         return <article className="reference-podcast-card" key={p.id}>
@@ -480,7 +493,7 @@ function LibraryPage({podcasts=[],episodes=[],progress={},onPlay,onOpen}){
           </div>
         </article>
       }):<div className="empty reference-empty">Chưa có Podcast phù hợp bộ lọc này.</div>}
-    </div>
+    </div>}
   </div>
 }
 
@@ -496,7 +509,7 @@ function PodcastDetailPage({podcast,episodes,onPlay,onBack,favorites,onFav}){
     <EpisodeList title="Tất cả tập" episodes={episodes} podcastById={{[podcast.id]:podcast}} onPlay={onPlay} favorites={favorites} onFav={onFav}/>
   </div>
 }
-function EpisodeList({title,episodes,podcastById,onPlay,favorites=[],onFav=(_id)=>{}}){return <section><div className="section-head"><div><span>Danh sách</span><h3>{title}</h3></div></div><div className="episode-list">{episodes.length?episodes.map(e=>{const p=podcastById[e.podcast_id];return <article className="episode-row" key={e.id}><button className="episode-play" onClick={()=>onPlay(e.id)}><Play size={17} fill="currentColor"/></button><img src={p?.image||p?.cover_url} alt=""/><div className="episode-main"><small>{p?.title}</small><strong>{e.title}</strong><p>{e.description}</p></div><span className="duration"><Clock3 size={14}/>{fmt(e.duration)}</span><button className={`icon-btn ${favorites.includes(e.id)?'liked':''}`} onClick={()=>onFav(e.id)}><Heart size={18} fill={favorites.includes(e.id)?'currentColor':'none'}/></button></article>}):<div className="empty">Chưa có tập nào ở đây.</div>}</div></section>}
+function EpisodeList({title,episodes,podcastById,onPlay,favorites=[],onFav=(_id)=>{}}){return <section><div className="section-head"><div><span>Danh sách</span><h3>{title}</h3></div></div><div className="episode-list">{episodes.length?episodes.map(e=>{const p=podcastById[e.podcast_id];return <article className="episode-row" key={e.id}><button className="episode-play" onClick={()=>onPlay(e.id)} aria-label={`Phát ${e.title}`}><Play size={17} fill="currentColor"/></button><img loading="lazy" decoding="async" src={p?.image||p?.cover_url} alt=""/><div className="episode-main"><small>{p?.title}</small><strong>{e.title}</strong><p>{e.description}</p></div><span className="duration"><Clock3 size={14}/>{fmt(e.duration)}</span><button className={`icon-btn ${favorites.includes(e.id)?'liked':''}`} onClick={()=>onFav(e.id)} aria-label={favorites.includes(e.id)?'Bỏ yêu thích':'Thêm vào yêu thích'}><Heart size={18} fill={favorites.includes(e.id)?'currentColor':'none'}/></button></article>}):<div className="empty">Chưa có tập nào ở đây.</div>}</div></section>}
 function HistoryPage({history,episodes,podcastById,onPlay}){const rows=history.map(h=>({...h,episode:episodes.find(e=>e.id===h.episode_id)})).filter(x=>x.episode);return <section><div className="section-head"><div><span>Gần đây</span><h3>Lịch sử nghe</h3></div></div><div className="episode-list">{rows.length?rows.map(r=><article className="episode-row" key={r.id}><button className="episode-play" onClick={()=>onPlay(r.episode.id)}><Play size={17}/></button><img src={podcastById[r.episode.podcast_id]?.image||podcastById[r.episode.podcast_id]?.cover_url} alt=""/><div className="episode-main"><small>{new Date(r.listened_at).toLocaleString('vi-VN')}</small><strong>{r.episode.title}</strong></div></article>):<div className="empty">Bạn chưa nghe tập nào.</div>}</div></section>}
 function PlaylistPage({playlists,setPlaylists,episodes,podcastById,onPlay,session}){
   const [selectedId,setSelectedId]=useState(null)
@@ -606,14 +619,14 @@ function PlaylistPage({playlists,setPlaylists,episodes,podcastById,onPlay,sessio
   </div>
 }
 
-function MusicPage({tracks,onPlay,onOpen,currentTrackId,activePlayer}){
+function MusicPage({tracks,onPlay,onOpen,currentTrackId,activePlayer,loading=false}){
   const fmtDate=value=>{if(!value)return '—';try{return new Date(value).toLocaleDateString('vi-VN',{day:'2-digit',month:'2-digit',year:'numeric'})}catch{return '—'}}
   return <div className="page-stack music-library-page">
     <section className="music-library-head"><div><span className="eyebrow">Thư viện âm nhạc</span><h2>Âm nhạc</h2><p>{tracks.length} bài hát trong thư viện</p></div></section>
     <section className="music-table-wrap">
       <div className="music-table-header"><span className="col-index">#</span><span className="col-title">Title</span><span className="col-album">Album</span><span className="col-date">Date added</span><span className="col-duration"><Clock3 size={16}/></span></div>
       <div className="music-table-body">
-        {tracks.length?tracks.map((t,index)=>{const isPlaying=currentTrackId===t.id&&activePlayer==='music';return <div className={`music-row ${isPlaying?'is-playing':''}`} key={t.id} onDoubleClick={()=>t.audio_url&&onPlay(t.id)}>
+        {loading?<div className="music-loading" aria-label="Đang tải âm nhạc">{Array.from({length:5},(_,i)=><div className="music-row-skeleton" key={i}><span className="skeleton skeleton-number"/><span className="skeleton skeleton-track"/><span className="skeleton skeleton-meta"/></div>)}</div>:tracks.length?tracks.map((t,index)=>{const isPlaying=currentTrackId===t.id&&activePlayer==='music';return <div className={`music-row ${isPlaying?'is-playing':''}`} key={t.id} onDoubleClick={()=>t.audio_url&&onPlay(t.id)}>
           <button type="button" className="track-index-wrap" onClick={()=>t.audio_url&&onPlay(t.id)} aria-label={`Phát ${t.title}`}><span className="track-index">{index+1}</span><span className="row-play">{isPlaying?<Pause size={15} fill="currentColor"/>:<Play size={15} fill="currentColor"/>}</span></button>
           <button type="button" className="music-title-cell music-open-button" onClick={()=>onOpen(t.id)}><span className="music-thumb">{t.cover_url?<img loading="lazy" decoding="async" src={t.cover_url} alt=""/>:<Music2 size={18}/>}</span><span className="music-title-text"><strong>{t.title}</strong><small>{t.artist||'Unknown artist'}</small></span></button>
           <span className="music-album">{t.album||'—'}</span><span className="music-date">{fmtDate(t.created_at)}</span><span className="music-duration">{t.duration?fmt(Number(t.duration)):'—'}</span>
@@ -641,6 +654,7 @@ function UnifiedPlayer({mediaType,episode,podcast,track,saved,tracks,onProgress,
   const listenBufferRef=useRef(0)
   const lastProgressSaveRef=useRef(0)
   const retryRef=useRef(0)
+  const stallTimerRef=useRef(null)
   const wasPlayingRef=useRef(false)
   const switchingRef=useRef(false)
   const lastUiTickRef=useRef(0)
@@ -651,6 +665,7 @@ function UnifiedPlayer({mediaType,episode,podcast,track,saved,tracks,onProgress,
   const [errorText,setErrorText]=useState('')
   const [volume,setVolume]=useState(()=>Number(readLocal().masterVolume??0.85))
   const [repeatMode,setRepeatMode]=useState(()=>readLocal().repeatMode||'all')
+  const [playbackRate,setPlaybackRate]=useState(()=>Number(readLocal().playbackRate)||1)
 
   const isMusic=mediaType==='music'
   const media=isMusic?track:episode
@@ -684,9 +699,6 @@ function UnifiedPlayer({mediaType,episode,podcast,track,saved,tracks,onProgress,
     setErrorText('');setBuffering(true)
     a.pause()
     mediaKeyRef.current=key
-    a.src=src
-    a.preload='metadata'
-    a.load()
     let resume=0
     if(!isMusic)resume=Number(saved?.current_time||0)
     else resume=Number(readLocal().mediaPositions?.[key]||0)
@@ -697,11 +709,25 @@ function UnifiedPlayer({mediaType,episode,podcast,track,saved,tracks,onProgress,
       setTime(a.currentTime||resume||0)
       setBuffering(false)
       switchingRef.current=false
-      a.play().then(()=>{setPlaying(true);wasPlayingRef.current=true;if(!isMusic&&episode)onHistory?.(episode)}).catch(()=>setPlaying(false))
       if(isMusic&&media?.id&&(!media.duration||Math.abs(Number(media.duration)-a.duration)>1)&&supabaseReady){supabase.from('music_tracks').update({duration:a.duration}).eq('id',media.id).then(()=>{})}
     }
     a.addEventListener('loadedmetadata',ready,{once:true})
+    a.src=src
+    a.preload='auto'
+    a.playbackRate=playbackRate
+    a.load()
+    // Start fetching/playing immediately. Waiting for all metadata first can make
+    // large MP3/M4A files feel slow, especially when the server has a cold cache.
+    a.play().then(()=>{
+      setPlaying(true);wasPlayingRef.current=true
+      if(!isMusic&&episode)onHistory?.(episode)
+    }).catch(()=>{
+      setPlaying(false)
+      switchingRef.current=false
+      setBuffering(false)
+    })
     return()=>{
+      clearTimeout(stallTimerRef.current)
       a.removeEventListener('loadedmetadata',ready)
       const seconds=Math.floor(listenBufferRef.current)
       if(seconds>0&&mediaId){listenBufferRef.current-=seconds;onListen?.(mediaType,mediaId,seconds)}
@@ -713,6 +739,7 @@ function UnifiedPlayer({mediaType,episode,podcast,track,saved,tracks,onProgress,
 
   useEffect(()=>{const a=audioRef.current;if(a)a.volume=volume;writeLocal({...readLocal(),masterVolume:volume})},[volume])
   useEffect(()=>{writeLocal({...readLocal(),repeatMode})},[repeatMode])
+  useEffect(()=>{const a=audioRef.current;if(a)a.playbackRate=playbackRate;writeLocal({...readLocal(),playbackRate})},[playbackRate])
   useEffect(()=>{if(playRequest>0&&audioRef.current&&media){audioRef.current.play().catch(()=>{})}},[playRequest])
 
   useEffect(()=>{
@@ -756,13 +783,43 @@ function UnifiedPlayer({mediaType,episode,podcast,track,saved,tracks,onProgress,
     const a=audioRef.current;if(!a||!src||retryRef.current>=2)return
     const resume=a.currentTime||lastTimeRef.current||0,shouldPlay=wasPlayingRef.current
     retryRef.current+=1;setBuffering(true);setErrorText('Đang thử nối lại âm thanh…')
-    setTimeout(()=>{if(!audioRef.current||mediaKeyRef.current!==key)return;const x=audioRef.current;x.src=src;x.load();x.addEventListener('loadedmetadata',()=>{if(resume>0&&resume<(x.duration||Infinity)-1)x.currentTime=resume;setBuffering(false);setErrorText('');if(shouldPlay)x.play().catch(()=>{})},{once:true})},900)
+    setTimeout(()=>{if(!audioRef.current||mediaKeyRef.current!==key)return;const x=audioRef.current;const restored=()=>{if(resume>0&&resume<(x.duration||Infinity)-1)x.currentTime=resume;x.playbackRate=playbackRate;setBuffering(false);setErrorText('');if(shouldPlay)x.play().catch(()=>{})};x.addEventListener('loadedmetadata',restored,{once:true});x.src=src;x.preload='auto';x.load()},900)
+  }
+
+  const bufferedAhead=()=>{
+    const a=audioRef.current
+    if(!a)return 0
+    for(let i=0;i<a.buffered.length;i++){
+      if(a.buffered.start(i)<=a.currentTime+.25&&a.buffered.end(i)>=a.currentTime)return a.buffered.end(i)-a.currentTime
+    }
+    return 0
+  }
+  const clearStallTimer=()=>{clearTimeout(stallTimerRef.current);stallTimerRef.current=null}
+  const handleCanPlay=()=>{clearStallTimer();setBuffering(false);setErrorText('')}
+  const handleProgress=()=>{
+    const a=audioRef.current
+    if(a&&(a.readyState>=HTMLMediaElement.HAVE_FUTURE_DATA||bufferedAhead()>5))handleCanPlay()
+  }
+  const handleWaiting=()=>{
+    setBuffering(true)
+    clearStallTimer()
+    stallTimerRef.current=setTimeout(()=>{
+      const a=audioRef.current
+      if(a&&mediaKeyRef.current===key&&a.readyState<HTMLMediaElement.HAVE_FUTURE_DATA)recover()
+    },7000)
+  }
+  const handleStalled=()=>{
+    const a=audioRef.current
+    // `stalled` only means the network stopped transferring. It is harmless when
+    // the browser already buffered enough audio, so do not show a false spinner.
+    if(a&&a.readyState<HTMLMediaElement.HAVE_FUTURE_DATA&&bufferedAhead()<1)handleWaiting()
   }
 
   const toggle=()=>{const a=audioRef.current;if(!a||!media)return;if(a.paused){a.play().catch(()=>{})}else a.pause()}
   const seekBy=n=>{const a=audioRef.current;if(a)a.currentTime=Math.max(0,Math.min(a.duration||0,a.currentTime+n))}
   const seek=e=>{const a=audioRef.current;if(a){a.currentTime=Number(e.target.value);lastTimeRef.current=a.currentTime}}
   const cycleRepeat=()=>setRepeatMode(m=>m==='off'?'all':m==='all'?'one':'off')
+  const cyclePlaybackRate=()=>setPlaybackRate(rate=>rate>=2?0.75:rate<1?1:rate<1.25?1.25:rate<1.5?1.5:2)
   const onEnded=()=>{
     flushListening();persistPosition();setPlaying(false);wasPlayingRef.current=false
     const a=audioRef.current
@@ -776,10 +833,10 @@ function UnifiedPlayer({mediaType,episode,podcast,track,saved,tracks,onProgress,
   const core=<>
     <div className="now unified-now"><div className="music-now-cover">{cover?<img src={cover} alt=""/>:(isMusic?<Disc3 size={22}/>:<Headphones size={22}/>)}</div><div><span className={`now-type ${isMusic?'music-type':'podcast-type'}`}>{isMusic?<Music2 size={12}/>:<Headphones size={12}/>} {isMusic?'ÂM NHẠC':'PODCAST'}</span><strong>{title}</strong><span className="music-artist">{subtitle}</span></div>{buffering?<LoaderCircle className="buffer-spin" size={18}/>:null}</div>
     <div className="controls"><div className="control-row music-main-controls"><button title="Trước" onClick={()=>prevHandler?.()}><SkipBack size={21}/></button><button className="play-main" onClick={toggle}>{playing?<Pause fill="currentColor"/>:<Play fill="currentColor"/>}</button><button title="Tiếp" onClick={()=>nextHandler?.()}><SkipForward size={21}/></button></div><div className="timeline"><span>{fmt(time)}</span><input type="range" min="0" max={duration||1} value={Math.min(time,duration||1)} onChange={seek}/><span>{fmt(duration)}</span></div></div>
-    <div className="extras"><button title="Tua lại" onClick={()=>seekBy(isMusic?-10:-15)}><RotateCcw size={17}/></button><button className={`repeat-btn ${repeatMode!=='off'?'active':''}`} title={repeatMode==='off'?'Lặp: Tắt':repeatMode==='all'?'Lặp tất cả':'Lặp 1 bài/tập'} onClick={cycleRepeat}><Repeat2 size={18}/>{repeatMode==='one'?<span className="repeat-one">1</span>:null}</button><Volume2 size={17}/><input className="volume" type="range" min="0" max="1" step=".05" value={volume} onChange={e=>setVolume(Number(e.target.value))}/></div>
+    <div className="extras"><button title="Tua lại" onClick={()=>seekBy(isMusic?-10:-15)}><RotateCcw size={17}/></button><button className="speed-btn" title="Tốc độ phát" onClick={cyclePlaybackRate}>{playbackRate}×</button><button className={`repeat-btn ${repeatMode!=='off'?'active':''}`} title={repeatMode==='off'?'Lặp: Tắt':repeatMode==='all'?'Lặp tất cả':'Lặp 1 bài/tập'} onClick={cycleRepeat}><Repeat2 size={18}/>{repeatMode==='one'?<span className="repeat-one">1</span>:null}</button><Volume2 size={17}/><input className="volume" type="range" min="0" max="1" step=".05" value={volume} onChange={e=>setVolume(Number(e.target.value))}/></div>
   </>
-  return <><div className="player unified-player"><audio ref={audioRef} playsInline preload="metadata" onTimeUpdate={handleTime} onPlay={()=>{setPlaying(true);wasPlayingRef.current=true;setBuffering(false);if('mediaSession' in navigator)navigator.mediaSession.playbackState='playing'}} onPause={()=>{setPlaying(false);if(!switchingRef.current){flushListening();persistPosition()}if('mediaSession' in navigator)navigator.mediaSession.playbackState='paused'}} onWaiting={()=>setBuffering(true)} onCanPlay={()=>setBuffering(false)} onStalled={()=>setBuffering(true)} onError={()=>{setErrorText('Mất kết nối âm thanh.');recover()}} onEnded={onEnded}/><button className="mobile-expand" onClick={()=>setFull(true)} aria-label="Mở trình phát đầy đủ"></button>{core}{errorText?<div className="player-error">{errorText}</div>:null}</div>
-    {full&&<div className="full-player"><div className="full-head"><button onClick={()=>setFull(false)}><ChevronDown/></button><span>{isMusic?'ĐANG PHÁT NHẠC':'ĐANG PHÁT PODCAST'}</span><button><MoreHorizontal/></button></div><div className="full-cover">{cover?<img src={cover} alt=""/>:<div className="full-cover-fallback">{isMusic?<Disc3 size={72}/>:<Headphones size={72}/>}</div>}</div>{core}</div>}
+  return <><div className="player unified-player"><audio ref={audioRef} playsInline preload="auto" onTimeUpdate={handleTime} onProgress={handleProgress} onPlay={()=>{setPlaying(true);wasPlayingRef.current=true;if('mediaSession' in navigator)navigator.mediaSession.playbackState='playing'}} onPlaying={handleCanPlay} onPause={()=>{setPlaying(false);if(!switchingRef.current){flushListening();persistPosition()}if('mediaSession' in navigator)navigator.mediaSession.playbackState='paused'}} onWaiting={handleWaiting} onCanPlay={handleCanPlay} onStalled={handleStalled} onError={()=>{clearStallTimer();setErrorText('Mất kết nối âm thanh.');recover()}} onEnded={onEnded}/><button className="mobile-expand" onClick={()=>setFull(true)} aria-label="Mở trình phát đầy đủ"></button>{core}{errorText?<div className="player-error">{errorText}</div>:null}</div>
+    {full&&<div className="full-player"><div className="full-head"><button onClick={()=>setFull(false)} aria-label="Thu nhỏ trình phát"><ChevronDown/></button><span>{isMusic?'ĐANG PHÁT NHẠC':'ĐANG PHÁT PODCAST'}</span><button aria-label="Tùy chọn khác" disabled><MoreHorizontal/></button></div><div className="full-cover">{cover?<img src={cover} alt=""/>:<div className="full-cover-fallback">{isMusic?<Disc3 size={72}/>:<Headphones size={72}/>}</div>}</div>{core}</div>}
   </>
 }
 
@@ -836,6 +893,7 @@ function ProfilePage({profile,session,setProfile,stats,podcastById}){
 }
 
 function ProfileModal({close,profile,session,setProfile}){
+  useEscapeClose(close)
   const [name,setName]=useState(profile?.display_name||'')
   const [bio,setBio]=useState(profile?.bio||'')
   const [msg,setMsg]=useState('')
@@ -846,7 +904,7 @@ function ProfileModal({close,profile,session,setProfile}){
     else{setProfile(data);setMsg('Đã lưu hồ sơ.')}
   }
   return <div className="modal-backdrop"><div className="modal">
-    <button className="close" onClick={close}><X/></button>
+    <button className="close" onClick={close} aria-label="Đóng"><X/></button>
     <div className="profile-avatar"><UserCircle2 size={44}/></div>
     <h3>Hồ sơ của bạn</h3><p className="muted">{session.user.email}</p>
     <label>Tên hiển thị<input value={name} onChange={e=>setName(e.target.value)}/></label>
@@ -879,7 +937,7 @@ function MusicStudio({onPublished,profile}){
   const upload=async(bucket,file,prefix)=>{
     const ext=file.name.split('.').pop()
     const path=`${prefix}/${crypto.randomUUID()}.${ext}`
-    const {error}=await supabase.storage.from(bucket).upload(path,file,{upsert:false})
+    const {error}=await supabase.storage.from(bucket).upload(path,file,{upsert:false,contentType:file.type||undefined,cacheControl:'31536000'})
     if(error)throw error
     return supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl
   }
@@ -953,10 +1011,10 @@ function MusicStudio({onPublished,profile}){
   </div>
 }
 
-function AuthModal({close,session,mode,setMode}){const[email,setEmail]=useState(''),[password,setPassword]=useState(''),[name,setName]=useState(''),[message,setMessage]=useState(''),[busy,setBusy]=useState(false)
+function AuthModal({close,session,mode,setMode}){useEscapeClose(close);const[email,setEmail]=useState(''),[password,setPassword]=useState(''),[name,setName]=useState(''),[message,setMessage]=useState(''),[busy,setBusy]=useState(false)
   const submit=async e=>{e.preventDefault();if(!supabaseReady){setMessage('Hãy cấu hình Supabase trong file .env trước.');return}setBusy(true);setMessage('');let r;if(mode==='signup')r=await supabase.auth.signUp({email,password,options:{data:{display_name:name||email.split('@')[0]}}});else r=await supabase.auth.signInWithPassword({email,password});setBusy(false);setMessage(r.error?r.error.message:(mode==='signup'?'Đăng ký thành công. Hãy kiểm tra email nếu Supabase bật xác nhận email.':'Đăng nhập thành công.'))}
-  if(session)return <div className="modal-backdrop"><div className="modal"><button className="close" onClick={close}><X/></button><div className="modal-icon"><UserRound/></div><h3>Tài khoản</h3><p className="muted">{session.user.email}</p><button className="primary wide" onClick={()=>supabase?.auth.signOut()}>Đăng xuất</button></div></div>
-  return <div className="modal-backdrop"><div className="modal"><button className="close" onClick={close}><X/></button><div className="modal-icon"><Headphones/></div><h3>{mode==='login'?'Chào mừng quay lại':'Tạo tài khoản'}</h3><p className="muted">Mọi tài khoản đều nghe chung thư viện podcast, nhưng tiến độ được lưu riêng.</p><form onSubmit={submit}>{mode==='signup'&&<label>Tên hiển thị<input value={name} onChange={e=>setName(e.target.value)} placeholder="Tên của bạn"/></label>}<label>Email<input type="email" required value={email} onChange={e=>setEmail(e.target.value)} placeholder="you@email.com"/></label><label>Mật khẩu<input type="password" minLength="6" required value={password} onChange={e=>setPassword(e.target.value)} placeholder="••••••••"/></label><button className="primary wide" disabled={busy}>{busy?'Đang xử lý...':mode==='login'?'Đăng nhập':'Đăng ký'}</button></form>{message&&<p className="form-message">{message}</p>}<button className="switch-auth" onClick={()=>setMode(mode==='login'?'signup':'login')}>{mode==='login'?'Chưa có tài khoản? Đăng ký':'Đã có tài khoản? Đăng nhập'}</button></div></div>}
+  if(session)return <div className="modal-backdrop"><div className="modal" role="dialog" aria-modal="true" aria-label="Tài khoản"><button className="close" onClick={close} aria-label="Đóng"><X/></button><div className="modal-icon"><UserRound/></div><h3>Tài khoản</h3><p className="muted">{session.user.email}</p><button className="primary wide" onClick={()=>supabase?.auth.signOut()}>Đăng xuất</button></div></div>
+  return <div className="modal-backdrop"><div className="modal" role="dialog" aria-modal="true" aria-label={mode==='login'?'Đăng nhập':'Tạo tài khoản'}><button className="close" onClick={close} aria-label="Đóng"><X/></button><div className="modal-icon"><Headphones/></div><h3>{mode==='login'?'Chào mừng quay lại':'Tạo tài khoản'}</h3><p className="muted">Mọi tài khoản đều nghe chung thư viện podcast, nhưng tiến độ được lưu riêng.</p><form onSubmit={submit}>{mode==='signup'&&<label>Tên hiển thị<input value={name} onChange={e=>setName(e.target.value)} placeholder="Tên của bạn"/></label>}<label>Email<input type="email" required value={email} onChange={e=>setEmail(e.target.value)} placeholder="you@email.com"/></label><label>Mật khẩu<input type="password" minLength="6" required value={password} onChange={e=>setPassword(e.target.value)} placeholder="••••••••"/></label><button className="primary wide" disabled={busy}>{busy?'Đang xử lý...':mode==='login'?'Đăng nhập':'Đăng ký'}</button></form>{message&&<p className="form-message">{message}</p>}<button className="switch-auth" onClick={()=>setMode(mode==='login'?'signup':'login')}>{mode==='login'?'Chưa có tài khoản? Đăng ký':'Đã có tài khoản? Đăng nhập'}</button></div></div>}
 
 function CreatorStudio({onPublished,profile}){
   const [tab,setTab]=useState('episode'),[podcasts,setPodcasts]=useState([]),[episodes,setEpisodes]=useState([]),[busy,setBusy]=useState(false),[msg,setMsg]=useState('')
@@ -977,7 +1035,7 @@ function CreatorStudio({onPublished,profile}){
   const upload=async(bucket,file,prefix)=>{
     const ext=file.name.split('.').pop()
     const path=`${prefix}/${crypto.randomUUID()}.${ext}`
-    const {error}=await supabase.storage.from(bucket).upload(path,file,{upsert:false})
+    const {error}=await supabase.storage.from(bucket).upload(path,file,{upsert:false,contentType:file.type||undefined,cacheControl:'31536000'})
     if(error)throw error
     return supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl
   }
@@ -1099,5 +1157,5 @@ function CreatorStudio({onPublished,profile}){
   </div>
 }
 
-function NoteModal({episode,timestamp,close,onSave}){const[text,setText]=useState('');return <div className="modal-backdrop"><div className="modal"><button className="close" onClick={close}><X/></button><div className="modal-icon"><StickyNote/></div><h3>Ghi chú tại {fmt(timestamp)}</h3><p className="muted">{episode.title}</p><textarea autoFocus rows="5" value={text} onChange={e=>setText(e.target.value)} placeholder="Ý tưởng, câu nói hay, điều muốn nhớ..."/><button className="primary wide" onClick={()=>onSave(text,timestamp)}>Lưu ghi chú</button></div></div>}
+function NoteModal({episode,timestamp,close,onSave}){useEscapeClose(close);const[text,setText]=useState('');return <div className="modal-backdrop"><div className="modal" role="dialog" aria-modal="true" aria-label="Ghi chú"><button className="close" onClick={close} aria-label="Đóng"><X/></button><div className="modal-icon"><StickyNote/></div><h3>Ghi chú tại {fmt(timestamp)}</h3><p className="muted">{episode.title}</p><textarea autoFocus rows="5" value={text} onChange={e=>setText(e.target.value)} placeholder="Ý tưởng, câu nói hay, điều muốn nhớ..."/><button className="primary wide" onClick={()=>onSave(text,timestamp)}>Lưu ghi chú</button></div></div>}
 function Toast({text,onDone}){useEffect(()=>{const t=setTimeout(onDone,2200);return()=>clearTimeout(t)},[]);return <div className="toast">{text}</div>}
