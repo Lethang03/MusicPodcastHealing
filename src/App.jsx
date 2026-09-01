@@ -17,8 +17,9 @@ function fmt(sec=0){
   return h?`${h}:${String(m).padStart(2,'0')}:${r}`:`${m}:${r}`
 }
 function readLocal(){try{return JSON.parse(localStorage.getItem(STORAGE_KEY)||'{}')}catch{return {}}}
-function writeLocal(v){localStorage.setItem(STORAGE_KEY,JSON.stringify(v))}
+function writeLocal(v){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(v));return true}catch{return false}}
 function localDateKey(value=new Date()){const d=value instanceof Date?value:new Date(value);if(Number.isNaN(d.getTime()))return '';return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`}
+function orderEpisodes(items=[]){return [...items].sort((a,b)=>{const ae=Number(a.episode_number),be=Number(b.episode_number);if(Number.isFinite(ae)&&Number.isFinite(be)&&ae!==be)return ae-be;return new Date(a.published_at||a.created_at||0)-new Date(b.published_at||b.created_at||0)})}
 function useEscapeClose(close){useEffect(()=>{const handler=e=>{if(e.key==='Escape')close()};window.addEventListener('keydown',handler);return()=>window.removeEventListener('keydown',handler)},[close])}
 const titleFor=p=>({home:'Podcast',music:'Âm nhạc',musicDetail:'Chi tiết bài hát',search:'Tìm kiếm Podcast',library:'Thư viện Podcast',podcastDetail:'Chi tiết Podcast',favorites:'Podcast yêu thích',playlists:'Playlist Podcast',history:'Lịch sử Podcast',stats:'Thống kê nghe',profile:'Hồ sơ',podcastStudio:'Podcast Studio',musicStudio:'Music Studio'})[p]||'Podcast Vault'
 
@@ -55,7 +56,12 @@ export default function App(){
   const [selectedTrackId,setSelectedTrackId]=useState(null)
   const [listeningEvents,setListeningEvents]=useState([])
   const [playRequest,setPlayRequest]=useState(0)
+  const progressRef=useRef(progress)
+  const progressWriteRef=useRef(new Map())
+  const libraryRequestRef=useRef(0)
   const deferredQuery=useDeferredValue(query)
+
+  useEffect(()=>{progressRef.current=progress},[progress])
 
   const podcastById=useMemo(()=>Object.fromEntries((podcasts||[]).filter(Boolean).map(p=>[p.id,p])),[podcasts])
   const current=(episodes||[]).find(e=>e.id===currentId)||null
@@ -113,6 +119,7 @@ export default function App(){
   },[])
 
   const loadPublicLibrary=useCallback(async()=>{
+    const requestId=++libraryRequestRef.current
     if(!supabaseReady||!session?.user){
       setPodcasts([])
       setEpisodes([])
@@ -126,6 +133,7 @@ export default function App(){
       supabase.from('episodes').select('*').eq('published',true).order('published_at',{ascending:false}),
       supabase.from('music_tracks').select('*').eq('published',true).order('created_at',{ascending:false})
     ])
+    if(requestId!==libraryRequestRef.current)return
     if(!pe) setPodcasts((p||[]).map(x=>({...x,image:x.cover_url||x.image})))
     if(!ee) setEpisodes(e||[])
     if(!te) setTracks(t||[])
@@ -140,6 +148,7 @@ export default function App(){
 
   useEffect(()=>{
     if(!supabaseReady||!session?.user){setProfile(null);return}
+    let cancelled=false
     ;(async()=>{
       const uid=session.user.id
       const [pr,pg,f,h,n,b,pls,ple,le]=await Promise.all([
@@ -151,28 +160,84 @@ export default function App(){
         supabase.from('bookmarks').select('*').eq('user_id',uid).order('created_at',{ascending:false}),
         supabase.from('playlists').select('*').eq('user_id',uid).order('created_at',{ascending:false}),
         supabase.from('playlist_episodes').select('*'),
-        supabase.from('listening_events').select('media_type,media_id,listened_seconds,listened_at').eq('user_id',uid).order('listened_at',{ascending:false})
+        supabase.from('listening_events').select('id,media_type,media_id,listened_seconds,listened_at').eq('user_id',uid).order('listened_at',{ascending:false})
       ])
+      if(cancelled)return
       if(pr.data)setProfile(pr.data)
-      if(pg.data)setProgress(Object.fromEntries(pg.data.map(x=>[x.episode_id,x])))
+      if(pg.data){
+        const merged=Object.fromEntries(pg.data.map(x=>[x.episode_id,x]))
+        const pending=(readLocal().pendingProgressWrites||[]).filter(write=>write.user_id===uid)
+        for(const item of pending){
+          const remote=merged[item.episode_id]
+          if(!remote||new Date(item.last_listened_at).getTime()>=new Date(remote.last_listened_at||0).getTime())merged[item.episode_id]=item
+        }
+        progressRef.current=merged
+        setProgress(merged)
+      }
       if(f.data)setFavorites(f.data.map(x=>x.episode_id))
       if(h.data)setHistory(h.data)
       if(n.data)setNotes(n.data)
       if(b.data)setBookmarks(b.data)
-      if(le?.data)setListeningEvents(le.data)
+      if(le?.data){
+        const pending=(readLocal().pendingListeningEvents||[]).filter(event=>!event.user_id||event.user_id===uid)
+        const seen=new Set(le.data.map(event=>event.id))
+        setListeningEvents([...pending.filter(event=>!seen.has(event.id)),...le.data])
+      }
       if(pls.data){
         setPlaylists(pls.data.map(p=>({...p,episode_ids:(ple.data||[]).filter(x=>x.playlist_id===p.id).sort((a,b)=>a.position-b.position).map(x=>x.episode_id)})))
       }
     })()
+    return()=>{cancelled=true}
   },[session])
 
   const saveProgress=useCallback(async(episode,currentTime,duration,completed=false)=>{
     if(!episode)return
-    const item={episode_id:episode.id,current_time:currentTime,duration:duration||episode.duration||0,progress_percent:duration?Math.min(100,currentTime/duration*100):0,completed,last_listened_at:new Date().toISOString()}
+    const safeTime=Math.max(0,Number(currentTime)||0)
+    const safeDuration=Math.max(0,Number(duration||episode.duration)||0)
+    const alreadyCompleted=Boolean(progressRef.current[episode.id]?.completed)
+    const item={episode_id:episode.id,current_time:safeTime,duration:safeDuration,progress_percent:safeDuration?Math.min(100,safeTime/safeDuration*100):0,completed:Boolean(completed||alreadyCompleted),last_listened_at:new Date().toISOString()}
+    progressRef.current={...progressRef.current,[episode.id]:{...progressRef.current[episode.id],...item}}
     setProgress(prev=>({...prev,[episode.id]:{...prev[episode.id],...item}}))
-    if(supabaseReady&&session?.user&&online){
-      await supabase.from('listening_progress').upsert({user_id:session.user.id,...item},{onConflict:'user_id,episode_id'})
+    if(session?.user){
+      const local=readLocal(),pending=local.pendingProgressWrites||[]
+      writeLocal({...local,pendingProgressWrites:[...pending.filter(write=>write.user_id!==session.user.id||write.episode_id!==episode.id),{user_id:session.user.id,...item}]})
     }
+    if(supabaseReady&&session?.user&&online){
+      const writeKey=`${session.user.id}:${episode.id}`
+      const previous=progressWriteRef.current.get(writeKey)||Promise.resolve()
+      const write=previous.catch(()=>{}).then(()=>supabase.from('listening_progress').upsert({user_id:session.user.id,...item},{onConflict:'user_id,episode_id'}))
+      progressWriteRef.current.set(writeKey,write)
+      const {error}=await write.catch(error=>({error}))
+      if(!error){
+        const local=readLocal(),pending=local.pendingProgressWrites||[]
+        writeLocal({...local,pendingProgressWrites:pending.filter(entry=>entry.user_id!==session.user.id||entry.episode_id!==episode.id||entry.last_listened_at!==item.last_listened_at)})
+      }
+      if(progressWriteRef.current.get(writeKey)===write)progressWriteRef.current.delete(writeKey)
+    }
+  },[session,online])
+
+  useEffect(()=>{
+    if(!supabaseReady||!session?.user||!online)return
+    const uid=session.user.id
+    const pending=(readLocal().pendingProgressWrites||[]).filter(write=>write.user_id===uid)
+    if(!pending.length)return
+    let cancelled=false
+    ;(async()=>{
+      for(const item of pending){
+        if(cancelled)break
+        const writeKey=`${uid}:${item.episode_id}`
+        const previous=progressWriteRef.current.get(writeKey)||Promise.resolve()
+        const write=previous.catch(()=>{}).then(()=>supabase.from('listening_progress').upsert(item,{onConflict:'user_id,episode_id'}))
+        progressWriteRef.current.set(writeKey,write)
+        const {error}=await write.catch(error=>({error}))
+        if(progressWriteRef.current.get(writeKey)===write)progressWriteRef.current.delete(writeKey)
+        if(!error&&!cancelled){
+          const local=readLocal(),current=local.pendingProgressWrites||[]
+          writeLocal({...local,pendingProgressWrites:current.filter(entry=>entry.user_id!==uid||entry.episode_id!==item.episode_id||entry.last_listened_at!==item.last_listened_at)})
+        }
+      }
+    })()
+    return()=>{cancelled=true}
   },[session,online])
 
   const addHistory=useCallback(async episode=>{
@@ -184,12 +249,37 @@ export default function App(){
 
   const recordListening=useCallback(async(mediaType,mediaId,seconds)=>{
     const safe=Math.max(0,Math.min(300,Math.round(Number(seconds)||0)))
-    if(!safe||!mediaId)return
-    const event={media_type:mediaType,media_id:mediaId,listened_seconds:safe,listened_at:new Date().toISOString()}
+    if(!safe||!mediaId||!session?.user)return
+    const event={id:crypto.randomUUID(),user_id:session?.user?.id,media_type:mediaType,media_id:mediaId,listened_seconds:safe,listened_at:new Date().toISOString()}
     setListeningEvents(prev=>[event,...prev].slice(0,5000))
     if(supabaseReady&&session?.user&&online){
-      await supabase.from('listening_events').insert({user_id:session.user.id,...event})
+      let error=null
+      try{({error}=await supabase.from('listening_events').insert(event))}catch(err){error=err}
+      if(!error)return
     }
+    const local=readLocal(),pending=local.pendingListeningEvents||[]
+    if(!pending.some(x=>x.id===event.id))writeLocal({...local,pendingListeningEvents:[...pending,event].slice(-5000)})
+  },[session,online])
+
+  useEffect(()=>{
+    if(!supabaseReady||!session?.user||!online)return
+    const pending=(readLocal().pendingListeningEvents||[]).filter(event=>!event.user_id||event.user_id===session.user.id)
+    if(!pending.length)return
+    let cancelled=false
+    ;(async()=>{
+      const succeeded=new Set()
+      for(const event of pending){
+        if(cancelled)break
+        let error=null
+        try{({error}=await supabase.from('listening_events').insert({...event,user_id:session.user.id}))}catch(err){error=err}
+        if(!error||error.code==='23505')succeeded.add(event.id)
+      }
+      if(!cancelled&&succeeded.size){
+        const local=readLocal(),current=local.pendingListeningEvents||[]
+        writeLocal({...local,pendingListeningEvents:current.filter(event=>!succeeded.has(event.id))})
+      }
+    })()
+    return()=>{cancelled=true}
   },[session,online])
 
   const toggleFav=async id=>{
@@ -220,6 +310,11 @@ export default function App(){
     if(!needle)return episodes
     return episodes.filter(e=>{const p=podcastById[e.podcast_id];return`${e.title} ${e.description||''} ${p?.title||''} ${p?.author||''}`.toLocaleLowerCase('vi').includes(needle)})
   },[episodes,podcastById,deferredQuery])
+  const filteredTracks=useMemo(()=>{
+    const needle=deferredQuery.trim().toLocaleLowerCase('vi')
+    if(!needle)return tracks
+    return tracks.filter(t=>`${t.title||''} ${t.artist||''} ${t.album||''}`.toLocaleLowerCase('vi').includes(needle))
+  },[tracks,deferredQuery])
 
   const stats=useMemo(()=>{
     const totalSeconds=listeningEvents.reduce((sum,e)=>sum+Math.max(0,Number(e.listened_seconds)||0),0)
@@ -259,25 +354,23 @@ export default function App(){
     if(activePlayer==='music'&&currentTrackId===id)setPlayRequest(v=>v+1)
     else{setCurrentTrackId(id);setActivePlayer('music')}
   }
-  const nextTrack=()=>{
+  const nextTrack=(wrap=true)=>{
     if(!tracks.length)return
     const idx=tracks.findIndex(t=>t.id===currentTrackId)
-    const next=tracks[(idx>=0?idx+1:0)%tracks.length]
-    if(next?.audio_url)playTrack(next.id)
-    else{
-      const playable=tracks.find(t=>t.audio_url&&t.id!==currentTrackId)||tracks.find(t=>t.audio_url)
-      if(playable)playTrack(playable.id)
-    }
+    const after=tracks.slice(Math.max(0,idx+1)).find(t=>t.audio_url)
+    const next=after||(wrap?tracks.slice(0,Math.max(0,idx+1)).find(t=>t.audio_url):null)
+    if(!next)return false
+    playTrack(next.id)
+    return true
   }
-  const previousTrack=()=>{
+  const previousTrack=(wrap=true)=>{
     if(!tracks.length)return
     const idx=tracks.findIndex(t=>t.id===currentTrackId)
-    const prev=tracks[(idx>0?idx-1:tracks.length-1)]
-    if(prev?.audio_url)playTrack(prev.id)
-    else{
-      const playable=[...tracks].reverse().find(t=>t.audio_url&&t.id!==currentTrackId)||[...tracks].reverse().find(t=>t.audio_url)
-      if(playable)playTrack(playable.id)
-    }
+    const before=tracks.slice(0,Math.max(0,idx)).reverse().find(t=>t.audio_url)
+    const prev=before||(wrap?tracks.slice(Math.max(0,idx+1)).reverse().find(t=>t.audio_url):null)
+    if(!prev)return false
+    playTrack(prev.id)
+    return true
   }
   const openPodcast=id=>{
     if(!id)return
@@ -307,28 +400,36 @@ export default function App(){
     setSelectedTrackId(null)
   }
 
-  const previousEpisode=()=>{
+  const previousEpisode=(wrap=true)=>{
     if(!current)return
-    const same=episodes.filter(e=>e.podcast_id===current.podcast_id)
+    const same=orderEpisodes(episodes.filter(e=>e.podcast_id===current.podcast_id))
     if(!same.length)return
     const idx=same.findIndex(e=>e.id===current.id)
+    if(idx===0&&!wrap)return false
     const prev=idx>0?same[idx-1]:same[same.length-1]
-    if(prev)setCurrentId(prev.id)
+    if(prev)playEpisode(prev.id)
+    return Boolean(prev)
   }
 
-  const nextEpisode=()=>{
+  const nextEpisode=(wrap=true)=>{
     // Queue luôn được ưu tiên. Khi Queue hết, tiếp tục theo thứ tự tập của podcast.
     if(queue.length){
-      const [next,...rest]=queue
-      setQueue(rest);setCurrentId(next);return
+      const nextIndex=queue.findIndex(id=>episodes.some(e=>e.id===id&&e.audio_url))
+      if(nextIndex>=0){
+        const next=queue[nextIndex]
+        setQueue(queue.slice(nextIndex+1));playEpisode(next);return true
+      }
+      setQueue([])
     }
     if(current){
-      const same=episodes.filter(e=>e.podcast_id===current.podcast_id)
+      const same=orderEpisodes(episodes.filter(e=>e.podcast_id===current.podcast_id))
       if(!same.length)return
       const idx=same.findIndex(e=>e.id===current.id)
-      const next=idx>=0&&same[idx+1]?same[idx+1]:same[0]
-      if(next)setCurrentId(next.id)
+      const next=idx>=0&&same[idx+1]?same[idx+1]:(wrap?same[0]:null)
+      if(next)playEpisode(next.id)
+      return Boolean(next)
     }
+    return false
   }
 
   if(authLoading){
@@ -384,7 +485,7 @@ export default function App(){
         {page==='home'&&<HomePage podcasts={podcasts} episodes={episodes} progress={progress} continueList={continueList} podcastById={podcastById} onPlay={playEpisode} favorites={favorites} onFav={toggleFav} setPage={setPage} loading={loadingLibrary}/>}
         {page==='music'&&<MusicPage tracks={tracks} onPlay={playTrack} onOpen={openTrack} currentTrackId={currentTrackId} activePlayer={activePlayer} loading={loadingLibrary}/>}
         {page==='musicDetail'&&<MusicDetailPage track={tracks.find(t=>t.id===selectedTrackId)} onPlay={playTrack} onBack={()=>setPage('music')} active={activePlayer==='music'&&currentTrackId===selectedTrackId}/>}
-        {page==='search'&&<SearchPage query={query} setQuery={setQuery} episodes={filtered} podcastById={podcastById} onPlay={playEpisode} favorites={favorites} onFav={toggleFav}/>}
+        {page==='search'&&<SearchPage query={query} setQuery={setQuery} episodes={filtered} tracks={filteredTracks} podcastById={podcastById} onPlay={playEpisode} onPlayTrack={playTrack} onOpenTrack={openTrack} favorites={favorites} onFav={toggleFav}/>}
         {page==='library'&&<LibraryPage podcasts={podcasts} episodes={episodes} progress={progress} onPlay={playEpisode} onOpen={openPodcast} loading={loadingLibrary}/>}
         {page==='podcastDetail'&&<PodcastDetailPage podcast={podcastById[selectedPodcastId]} episodes={episodes.filter(e=>e.podcast_id===selectedPodcastId)} onPlay={playEpisode} onBack={()=>setPage('library')} favorites={favorites} onFav={toggleFav}/>}
         {page==='favorites'&&<EpisodeList title="Tập đã lưu" episodes={episodes.filter(e=>favorites.includes(e.id))} podcastById={podcastById} onPlay={playEpisode} favorites={favorites} onFav={toggleFav}/>}
@@ -414,6 +515,11 @@ export default function App(){
       full={fullPlayer}
       setFull={setFullPlayer}
       playRequest={playRequest}
+      queue={queue}
+      setQueue={setQueue}
+      episodes={episodes}
+      podcastById={podcastById}
+      onPlayEpisode={playEpisode}
     />
 
     {authOpen&&<AuthModal close={()=>setAuthOpen(false)} session={session} mode={authMode} setMode={setAuthMode}/>}
@@ -441,7 +547,7 @@ function HomePage({podcasts,episodes,progress,continueList,podcastById,onPlay,fa
   </div>
 }
 function LoadingCards({count=6}){return <div className="podcast-grid loading-grid" aria-label="Đang tải thư viện">{Array.from({length:count},(_,i)=><div className="skeleton-card" key={i}><span className="skeleton skeleton-cover"/><span className="skeleton skeleton-line short"/><span className="skeleton skeleton-line"/><span className="skeleton skeleton-line medium"/></div>)}</div>}
-function SearchPage({query,setQuery,episodes,podcastById,onPlay,favorites,onFav}){return <div className="page-stack"><div className="searchbox"><Search size={20}/><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Tìm tên podcast, tập, chủ đề..."/></div><EpisodeList title={query?`Kết quả cho “${query}”`:'Tất cả tập'} episodes={episodes} podcastById={podcastById} onPlay={onPlay} favorites={favorites} onFav={onFav}/></div>}
+function SearchPage({query,setQuery,episodes,tracks,podcastById,onPlay,onPlayTrack,onOpenTrack,favorites,onFav}){return <div className="page-stack"><div className="searchbox"><Search size={20}/><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Tìm podcast, tập, bài hát, artist..."/></div><EpisodeList title={query?`Podcast cho “${query}”`:'Tất cả tập'} episodes={episodes} podcastById={podcastById} onPlay={onPlay} favorites={favorites} onFav={onFav}/><section><div className="section-head"><div><span>ÂM NHẠC</span><h3>{query?`Bài hát cho “${query}”`:'Tất cả bài hát'}</h3></div></div><div className="episode-list">{tracks.length?tracks.map(t=><article className="episode-row" key={t.id}><button className="episode-play" disabled={!t.audio_url} onClick={()=>onPlayTrack(t.id)}><Play size={17} fill="currentColor"/></button><div className="music-thumb">{t.cover_url?<img loading="lazy" decoding="async" src={t.cover_url} alt=""/>:<Music2 size={18}/>}</div><button className="search-track-copy" onClick={()=>onOpenTrack(t.id)}><small>{t.artist||'Unknown artist'}</small><strong>{t.title}</strong><p>{t.album||''}</p></button><span className="duration"><Clock3 size={14}/>{t.duration?fmt(Number(t.duration)):'—'}</span></article>):<div className="empty">Không có bài hát phù hợp.</div>}</div></section></div>}
 function LibraryPage({podcasts=[],episodes=[],progress={},onPlay,onOpen,loading=false}){
   const [filter,setFilter]=useState('all')
   const [view,setView]=useState('grid')
@@ -647,10 +753,11 @@ function MusicDetailPage({track,onPlay,onBack,active}){
   </div>
 }
 
-function UnifiedPlayer({mediaType,episode,podcast,track,saved,tracks,onProgress,onHistory,onListen,onPrevPodcast,onNextPodcast,onPrevMusic,onNextMusic,full,setFull,playRequest}){
+function UnifiedPlayer({mediaType,episode,podcast,track,saved,onProgress,onHistory,onListen,onPrevPodcast,onNextPodcast,onPrevMusic,onNextMusic,full,setFull,playRequest,queue,setQueue,episodes,podcastById,onPlayEpisode}){
   const audioRef=useRef(null)
   const mediaKeyRef=useRef('')
   const lastTimeRef=useRef(0)
+  const lastTimeEventRef=useRef(0)
   const listenBufferRef=useRef(0)
   const lastProgressSaveRef=useRef(0)
   const retryRef=useRef(0)
@@ -658,14 +765,18 @@ function UnifiedPlayer({mediaType,episode,podcast,track,saved,tracks,onProgress,
   const wasPlayingRef=useRef(false)
   const switchingRef=useRef(false)
   const lastUiTickRef=useRef(0)
+  const recoveryTimerRef=useRef(null)
+  const sourceGenerationRef=useRef(0)
+  const recoveryMetadataHandlerRef=useRef(null)
   const [playing,setPlaying]=useState(false)
   const [time,setTime]=useState(0)
   const [duration,setDuration]=useState(0)
   const [buffering,setBuffering]=useState(false)
   const [errorText,setErrorText]=useState('')
   const [volume,setVolume]=useState(()=>Number(readLocal().masterVolume??0.85))
-  const [repeatMode,setRepeatMode]=useState(()=>readLocal().repeatMode||'all')
+  const [repeatMode,setRepeatMode]=useState(()=>readLocal().repeatMode||'off')
   const [playbackRate,setPlaybackRate]=useState(()=>Number(readLocal().playbackRate)||1)
+  const [queueOpen,setQueueOpen]=useState(false)
 
   const isMusic=mediaType==='music'
   const media=isMusic?track:episode
@@ -677,6 +788,8 @@ function UnifiedPlayer({mediaType,episode,podcast,track,saved,tracks,onProgress,
   const key=mediaId?`${mediaType}:${mediaId}`:''
   const nextHandler=isMusic?onNextMusic:onNextPodcast
   const prevHandler=isMusic?onPrevMusic:onPrevPodcast
+  const navigationRef=useRef({nextHandler,prevHandler,repeatMode})
+  navigationRef.current={nextHandler,prevHandler,repeatMode}
 
   const flushListening=useCallback(()=>{
     const seconds=Math.floor(listenBufferRef.current)
@@ -686,7 +799,7 @@ function UnifiedPlayer({mediaType,episode,podcast,track,saved,tracks,onProgress,
   const persistPosition=useCallback(()=>{
     const a=audioRef.current;if(!a||!mediaId)return
     const local=readLocal(),positions={...(local.mediaPositions||{}),[key]:a.currentTime||0}
-    writeLocal({...local,mediaPositions:positions,masterVolume:volume})
+    writeLocal({...local,mediaPositions:positions,masterVolume:volume,playbackSnapshot:{key,media_id:mediaId,type:mediaType,currentTime:a.currentTime||0,playing:!a.paused&&!a.ended,updated_at:new Date().toISOString()}})
     if(!isMusic&&episode)onProgress?.(episode,a.currentTime,a.duration||episode.duration||0,(a.duration||0)>0&&a.currentTime/a.duration>.95)
   },[mediaId,key,volume,isMusic,episode,onProgress])
 
@@ -694,45 +807,60 @@ function UnifiedPlayer({mediaType,episode,podcast,track,saved,tracks,onProgress,
     const a=audioRef.current
     if(!a||!src||!key)return
     switchingRef.current=true
+    const generation=++sourceGenerationRef.current
     retryRef.current=0
     listenBufferRef.current=0
     setErrorText('');setBuffering(true)
     a.pause()
     mediaKeyRef.current=key
-    let resume=0
-    if(!isMusic)resume=Number(saved?.current_time||0)
-    else resume=Number(readLocal().mediaPositions?.[key]||0)
+    const local=readLocal(),snapshot=local.playbackSnapshot
+    const localResume=Number(local.mediaPositions?.[key]||0)
+    const remoteResume=!isMusic?Number(saved?.current_time||0):0
+    const localIsNewer=snapshot?.key===key&&new Date(snapshot.updated_at||0).getTime()>=new Date(saved?.last_listened_at||0).getTime()
+    const resume=!isMusic?(localIsNewer?Number(snapshot.currentTime||localResume):(saved?.last_listened_at?remoteResume:localResume)):localResume
+    const shouldAutoPlay=snapshot?.key===key?snapshot.playing!==false:true
+    lastTimeRef.current=resume
+    lastTimeEventRef.current=performance.now()
     const ready=()=>{
+      if(generation!==sourceGenerationRef.current||mediaKeyRef.current!==key)return
       setDuration(a.duration||Number(media?.duration)||0)
       if(resume>0&&resume<(a.duration||Infinity)-2){try{a.currentTime=resume}catch{}}
       lastTimeRef.current=a.currentTime||resume||0
+      lastTimeEventRef.current=performance.now()
       setTime(a.currentTime||resume||0)
       setBuffering(false)
       switchingRef.current=false
-      if(isMusic&&media?.id&&(!media.duration||Math.abs(Number(media.duration)-a.duration)>1)&&supabaseReady){supabase.from('music_tracks').update({duration:a.duration}).eq('id',media.id).then(()=>{})}
     }
-    a.addEventListener('loadedmetadata',ready,{once:true})
-    a.src=src
+    const normalizedSrc=new URL(src,window.location.href).href
+    const sourceChanged=a.currentSrc!==normalizedSrc&&a.src!==normalizedSrc
+    if(sourceChanged){a.addEventListener('loadedmetadata',ready,{once:true});a.src=src}
+    else if(a.readyState>=HTMLMediaElement.HAVE_METADATA)ready()
+    else a.addEventListener('loadedmetadata',ready,{once:true})
     a.preload='auto'
     a.playbackRate=playbackRate
-    a.load()
+    if(sourceChanged)a.load()
     // Start fetching/playing immediately. Waiting for all metadata first can make
     // large MP3/M4A files feel slow, especially when the server has a cold cache.
-    a.play().then(()=>{
+    if(shouldAutoPlay){wasPlayingRef.current=true;a.play().then(()=>{
+      if(generation!==sourceGenerationRef.current||mediaKeyRef.current!==key)return
       setPlaying(true);wasPlayingRef.current=true
       if(!isMusic&&episode)onHistory?.(episode)
     }).catch(()=>{
+      if(generation!==sourceGenerationRef.current||mediaKeyRef.current!==key)return
+      wasPlayingRef.current=false
       setPlaying(false)
       switchingRef.current=false
       setBuffering(false)
-    })
+    })}else{wasPlayingRef.current=false;setPlaying(false);setBuffering(false);switchingRef.current=false;if('mediaSession' in navigator)navigator.mediaSession.playbackState='paused'}
     return()=>{
       clearTimeout(stallTimerRef.current)
+      clearTimeout(recoveryTimerRef.current)
+      if(recoveryMetadataHandlerRef.current){a.removeEventListener('loadedmetadata',recoveryMetadataHandlerRef.current);recoveryMetadataHandlerRef.current=null}
       a.removeEventListener('loadedmetadata',ready)
       const seconds=Math.floor(listenBufferRef.current)
       if(seconds>0&&mediaId){listenBufferRef.current-=seconds;onListen?.(mediaType,mediaId,seconds)}
       const local=readLocal(),positions={...(local.mediaPositions||{}),[key]:a.currentTime||0}
-      writeLocal({...local,mediaPositions:positions,masterVolume:a.volume})
+      writeLocal({...local,mediaPositions:positions,masterVolume:a.volume,playbackSnapshot:{key,media_id:mediaId,type:mediaType,currentTime:a.currentTime||0,playing:!a.paused&&!a.ended,updated_at:new Date().toISOString()}})
       if(!isMusic&&episode)onProgress?.(episode,a.currentTime,a.duration||episode.duration||0,(a.duration||0)>0&&a.currentTime/a.duration>.95)
     }
   },[key,src])
@@ -740,36 +868,42 @@ function UnifiedPlayer({mediaType,episode,podcast,track,saved,tracks,onProgress,
   useEffect(()=>{const a=audioRef.current;if(a)a.volume=volume;writeLocal({...readLocal(),masterVolume:volume})},[volume])
   useEffect(()=>{writeLocal({...readLocal(),repeatMode})},[repeatMode])
   useEffect(()=>{const a=audioRef.current;if(a)a.playbackRate=playbackRate;writeLocal({...readLocal(),playbackRate})},[playbackRate])
-  useEffect(()=>{if(playRequest>0&&audioRef.current&&media){audioRef.current.play().catch(()=>{})}},[playRequest])
+  useEffect(()=>{if(playRequest>0&&audioRef.current&&media){audioRef.current.play().catch(()=>setErrorText('Trình duyệt đã chặn phát tự động. Hãy bấm Play.'))}},[playRequest])
 
   useEffect(()=>{
     if(!media||!('mediaSession' in navigator))return
+    const setHandler=(action,handler)=>{try{navigator.mediaSession.setActionHandler(action,handler)}catch{}}
     try{
       navigator.mediaSession.metadata=new MediaMetadata({title:title||'Đang phát',artist:subtitle||'Podcast Vault',album:isMusic?(track?.album||'Âm nhạc'):'Podcast',artwork:cover?[{src:cover,sizes:'512x512'}]:[]})
-      navigator.mediaSession.setActionHandler('play',()=>audioRef.current?.play())
-      navigator.mediaSession.setActionHandler('pause',()=>audioRef.current?.pause())
-      navigator.mediaSession.setActionHandler('previoustrack',()=>prevHandler?.())
-      navigator.mediaSession.setActionHandler('nexttrack',()=>nextHandler?.())
-      navigator.mediaSession.setActionHandler('seekbackward',d=>{if(audioRef.current)audioRef.current.currentTime=Math.max(0,audioRef.current.currentTime-(d.seekOffset||15))})
-      navigator.mediaSession.setActionHandler('seekforward',d=>{if(audioRef.current)audioRef.current.currentTime=Math.min(audioRef.current.duration||Infinity,audioRef.current.currentTime+(d.seekOffset||30))})
-      navigator.mediaSession.setActionHandler('seekto',d=>{if(audioRef.current&&Number.isFinite(d.seekTime))audioRef.current.currentTime=d.seekTime})
     }catch{}
-  },[key,title,subtitle,cover,isMusic,track?.album,prevHandler,nextHandler])
+    setHandler('play',()=>{const a=audioRef.current;if(!a)return;wasPlayingRef.current=true;a.play().catch(()=>{wasPlayingRef.current=false;setErrorText('Không phát được file âm thanh.')})})
+    setHandler('pause',()=>{wasPlayingRef.current=false;audioRef.current?.pause()})
+    setHandler('previoustrack',()=>{const a=audioRef.current;if(a?.currentTime>5){a.currentTime=0;lastTimeRef.current=0;lastTimeEventRef.current=performance.now();setTime(0)}else{const nav=navigationRef.current;nav.prevHandler?.(nav.repeatMode==='all')}})
+    setHandler('nexttrack',()=>{const nav=navigationRef.current;nav.nextHandler?.(nav.repeatMode==='all')})
+    setHandler('seekbackward',d=>{const a=audioRef.current;if(a){a.currentTime=Math.max(0,a.currentTime-(d.seekOffset||15));lastTimeRef.current=a.currentTime;lastTimeEventRef.current=performance.now()}})
+    setHandler('seekforward',d=>{const a=audioRef.current;if(a){a.currentTime=Math.min(a.duration||Infinity,a.currentTime+(d.seekOffset||30));lastTimeRef.current=a.currentTime;lastTimeEventRef.current=performance.now()}})
+    setHandler('seekto',d=>{const a=audioRef.current;if(a&&Number.isFinite(d.seekTime)){a.currentTime=Math.max(0,Math.min(a.duration||Infinity,d.seekTime));lastTimeRef.current=a.currentTime;lastTimeEventRef.current=performance.now()}})
+    return()=>{for(const action of ['play','pause','previoustrack','nexttrack','seekbackward','seekforward','seekto'])setHandler(action,null);try{navigator.mediaSession.metadata=null;navigator.mediaSession.playbackState='none'}catch{}}
+  },[key,title,subtitle,cover,isMusic,track?.album])
 
 
   useEffect(()=>{
-    const handler=()=>{persistPosition();flushListening()}
+    const handler=()=>{if(document.visibilityState==='hidden'){persistPosition();flushListening()}}
+    const leaving=()=>{persistPosition();flushListening()}
     document.addEventListener('visibilitychange',handler)
-    window.addEventListener('pagehide',handler)
-    return()=>{document.removeEventListener('visibilitychange',handler);window.removeEventListener('pagehide',handler)}
+    window.addEventListener('pagehide',leaving)
+    window.addEventListener('beforeunload',leaving)
+    return()=>{document.removeEventListener('visibilitychange',handler);window.removeEventListener('pagehide',leaving);window.removeEventListener('beforeunload',leaving)}
   },[persistPosition,flushListening])
 
   const handleTime=()=>{
     const a=audioRef.current;if(!a)return
-    const now=a.currentTime||0,delta=now-lastTimeRef.current
-    if(!a.paused&&delta>0&&delta<5)listenBufferRef.current+=delta
+    const now=a.currentTime||0,delta=now-lastTimeRef.current,stamp=performance.now()
+    const wallDelta=lastTimeEventRef.current?Math.max(0,(stamp-lastTimeEventRef.current)/1000):0
+    const rate=Math.max(.25,a.playbackRate||1)
+    if(!a.paused&&delta>0&&wallDelta>0&&wallDelta<300&&delta<=wallDelta*rate+1.5)listenBufferRef.current+=Math.min(wallDelta,delta/rate)
     lastTimeRef.current=now
-    const stamp=performance.now()
+    lastTimeEventRef.current=stamp
     if(stamp-lastUiTickRef.current>=250){
       lastUiTickRef.current=stamp
       setTime(now)
@@ -781,9 +915,14 @@ function UnifiedPlayer({mediaType,episode,podcast,track,saved,tracks,onProgress,
 
   const recover=()=>{
     const a=audioRef.current;if(!a||!src||retryRef.current>=2)return
-    const resume=a.currentTime||lastTimeRef.current||0,shouldPlay=wasPlayingRef.current
+    const wasSwitching=switchingRef.current
+    const resume=(wasSwitching?lastTimeRef.current:a.currentTime)||lastTimeRef.current||0,shouldPlay=wasPlayingRef.current
+    if(!wasSwitching)persistPosition()
+    switchingRef.current=true
     retryRef.current+=1;setBuffering(true);setErrorText('Đang thử nối lại âm thanh…')
-    setTimeout(()=>{if(!audioRef.current||mediaKeyRef.current!==key)return;const x=audioRef.current;const restored=()=>{if(resume>0&&resume<(x.duration||Infinity)-1)x.currentTime=resume;x.playbackRate=playbackRate;setBuffering(false);setErrorText('');if(shouldPlay)x.play().catch(()=>{})};x.addEventListener('loadedmetadata',restored,{once:true});x.src=src;x.preload='auto';x.load()},900)
+    const generation=sourceGenerationRef.current
+    clearTimeout(recoveryTimerRef.current)
+    recoveryTimerRef.current=setTimeout(()=>{if(!audioRef.current||mediaKeyRef.current!==key||generation!==sourceGenerationRef.current)return;const x=audioRef.current;if(recoveryMetadataHandlerRef.current)x.removeEventListener('loadedmetadata',recoveryMetadataHandlerRef.current);const restored=()=>{recoveryMetadataHandlerRef.current=null;if(mediaKeyRef.current!==key||generation!==sourceGenerationRef.current)return;if(resume>0&&resume<(x.duration||Infinity)-1)x.currentTime=resume;x.playbackRate=playbackRate;lastTimeRef.current=x.currentTime||resume;lastTimeEventRef.current=performance.now();switchingRef.current=false;setBuffering(false);setErrorText('');if(shouldPlay)x.play().catch(()=>setErrorText('Không thể tiếp tục phát. Hãy thử lại.'))};recoveryMetadataHandlerRef.current=restored;x.addEventListener('loadedmetadata',restored,{once:true});x.load()},900)
   }
 
   const bufferedAhead=()=>{
@@ -815,28 +954,31 @@ function UnifiedPlayer({mediaType,episode,podcast,track,saved,tracks,onProgress,
     if(a&&a.readyState<HTMLMediaElement.HAVE_FUTURE_DATA&&bufferedAhead()<1)handleWaiting()
   }
 
-  const toggle=()=>{const a=audioRef.current;if(!a||!media)return;if(a.paused){a.play().catch(()=>{})}else a.pause()}
-  const seekBy=n=>{const a=audioRef.current;if(a)a.currentTime=Math.max(0,Math.min(a.duration||0,a.currentTime+n))}
-  const seek=e=>{const a=audioRef.current;if(a){a.currentTime=Number(e.target.value);lastTimeRef.current=a.currentTime}}
+  const toggle=()=>{const a=audioRef.current;if(!a||!media)return;if(a.paused){a.play().catch(()=>setErrorText('Không phát được file âm thanh.'))}else{wasPlayingRef.current=false;a.pause()}}
+  const seekBy=n=>{const a=audioRef.current;if(a){a.currentTime=Math.max(0,Math.min(a.duration||0,a.currentTime+n));lastTimeRef.current=a.currentTime;lastTimeEventRef.current=performance.now()}}
+  const seek=e=>{const a=audioRef.current;if(a){a.currentTime=Number(e.target.value);lastTimeRef.current=a.currentTime;lastTimeEventRef.current=performance.now()}}
   const cycleRepeat=()=>setRepeatMode(m=>m==='off'?'all':m==='all'?'one':'off')
   const cyclePlaybackRate=()=>setPlaybackRate(rate=>rate>=2?0.75:rate<1?1:rate<1.25?1.25:rate<1.5?1.5:2)
   const onEnded=()=>{
     flushListening();persistPosition();setPlaying(false);wasPlayingRef.current=false
+    if('mediaSession' in navigator)navigator.mediaSession.playbackState='paused'
     const a=audioRef.current
-    if(repeatMode==='one'&&a){a.currentTime=0;a.play().catch(()=>{});return}
-    if(repeatMode==='all'){nextHandler?.();return}
-    if(a){a.currentTime=0;setTime(0)}
+    if(repeatMode==='one'&&a){a.currentTime=0;lastTimeRef.current=0;lastTimeEventRef.current=performance.now();wasPlayingRef.current=true;a.play().catch(()=>setErrorText('Không thể phát lại.'));return}
+    if(nextHandler?.(repeatMode==='all'))return
+    if(a)setTime(a.duration||time)
   }
+  const previous=()=>{const a=audioRef.current;if(!a)return;if(a.currentTime>5){a.currentTime=0;lastTimeRef.current=0;setTime(0);persistPosition();return}prevHandler?.(repeatMode==='all')}
+  const retry=()=>{retryRef.current=0;wasPlayingRef.current=true;recover()}
 
   if(!media)return <div className="player"><div className="player-placeholder"><Headphones size={18}/> Chưa có nội dung đang phát.</div></div>
 
   const core=<>
     <div className="now unified-now"><div className="music-now-cover">{cover?<img src={cover} alt=""/>:(isMusic?<Disc3 size={22}/>:<Headphones size={22}/>)}</div><div><span className={`now-type ${isMusic?'music-type':'podcast-type'}`}>{isMusic?<Music2 size={12}/>:<Headphones size={12}/>} {isMusic?'ÂM NHẠC':'PODCAST'}</span><strong>{title}</strong><span className="music-artist">{subtitle}</span></div>{buffering?<LoaderCircle className="buffer-spin" size={18}/>:null}</div>
-    <div className="controls"><div className="control-row music-main-controls"><button title="Trước" onClick={()=>prevHandler?.()}><SkipBack size={21}/></button><button className="play-main" onClick={toggle}>{playing?<Pause fill="currentColor"/>:<Play fill="currentColor"/>}</button><button title="Tiếp" onClick={()=>nextHandler?.()}><SkipForward size={21}/></button></div><div className="timeline"><span>{fmt(time)}</span><input type="range" min="0" max={duration||1} value={Math.min(time,duration||1)} onChange={seek}/><span>{fmt(duration)}</span></div></div>
-    <div className="extras"><button title="Tua lại" onClick={()=>seekBy(isMusic?-10:-15)}><RotateCcw size={17}/></button><button className="speed-btn" title="Tốc độ phát" onClick={cyclePlaybackRate}>{playbackRate}×</button><button className={`repeat-btn ${repeatMode!=='off'?'active':''}`} title={repeatMode==='off'?'Lặp: Tắt':repeatMode==='all'?'Lặp tất cả':'Lặp 1 bài/tập'} onClick={cycleRepeat}><Repeat2 size={18}/>{repeatMode==='one'?<span className="repeat-one">1</span>:null}</button><Volume2 size={17}/><input className="volume" type="range" min="0" max="1" step=".05" value={volume} onChange={e=>setVolume(Number(e.target.value))}/></div>
+    <div className="controls"><div className="control-row music-main-controls"><button title="Trước" onClick={previous}><SkipBack size={21}/></button><button className="play-main" onClick={toggle}>{playing?<Pause fill="currentColor"/>:<Play fill="currentColor"/>}</button><button title="Tiếp" onClick={()=>nextHandler?.(repeatMode==='all')}><SkipForward size={21}/></button></div><div className="timeline"><span>{fmt(time)}</span><input type="range" min="0" max={duration||1} value={Math.min(time,duration||1)} onChange={seek}/><span>{fmt(duration)}</span></div></div>
+    <div className="extras"><button title="Tua lại" onClick={()=>seekBy(isMusic?-10:-15)}><RotateCcw size={17}/></button>{!isMusic&&<button className="speed-btn" title="Tốc độ phát" onClick={cyclePlaybackRate}>{playbackRate}×</button>}<button className={`repeat-btn ${repeatMode!=='off'?'active':''}`} title={repeatMode==='off'?'Lặp: Tắt':repeatMode==='all'?'Lặp tất cả':'Lặp 1 bài/tập'} onClick={cycleRepeat}><Repeat2 size={18}/>{repeatMode==='one'?<span className="repeat-one">1</span>:null}</button>{!isMusic&&<button className="queue-toggle" title="Queue" onClick={()=>setQueueOpen(v=>!v)}><ListMusic size={18}/></button>}<Volume2 size={17}/><input className="volume" type="range" min="0" max="1" step=".05" value={volume} onChange={e=>setVolume(Number(e.target.value))}/></div>
   </>
-  return <><div className="player unified-player"><audio ref={audioRef} playsInline preload="auto" onTimeUpdate={handleTime} onProgress={handleProgress} onPlay={()=>{setPlaying(true);wasPlayingRef.current=true;if('mediaSession' in navigator)navigator.mediaSession.playbackState='playing'}} onPlaying={handleCanPlay} onPause={()=>{setPlaying(false);if(!switchingRef.current){flushListening();persistPosition()}if('mediaSession' in navigator)navigator.mediaSession.playbackState='paused'}} onWaiting={handleWaiting} onCanPlay={handleCanPlay} onStalled={handleStalled} onError={()=>{clearStallTimer();setErrorText('Mất kết nối âm thanh.');recover()}} onEnded={onEnded}/><button className="mobile-expand" onClick={()=>setFull(true)} aria-label="Mở trình phát đầy đủ"></button>{core}{errorText?<div className="player-error">{errorText}</div>:null}</div>
-    {full&&<div className="full-player"><div className="full-head"><button onClick={()=>setFull(false)} aria-label="Thu nhỏ trình phát"><ChevronDown/></button><span>{isMusic?'ĐANG PHÁT NHẠC':'ĐANG PHÁT PODCAST'}</span><button aria-label="Tùy chọn khác" disabled><MoreHorizontal/></button></div><div className="full-cover">{cover?<img src={cover} alt=""/>:<div className="full-cover-fallback">{isMusic?<Disc3 size={72}/>:<Headphones size={72}/>}</div>}</div>{core}</div>}
+  return <><div className="player unified-player"><audio ref={audioRef} playsInline preload="auto" onLoadStart={()=>setBuffering(true)} onLoadedMetadata={()=>setDuration(audioRef.current?.duration||Number(media?.duration)||0)} onTimeUpdate={handleTime} onProgress={handleProgress} onPlay={()=>{setPlaying(true);wasPlayingRef.current=true;if('mediaSession' in navigator)navigator.mediaSession.playbackState='playing'}} onPlaying={handleCanPlay} onPause={()=>{setPlaying(false);if(!switchingRef.current){flushListening();persistPosition()}if('mediaSession' in navigator)navigator.mediaSession.playbackState='paused'}} onWaiting={handleWaiting} onCanPlay={handleCanPlay} onCanPlayThrough={handleCanPlay} onStalled={handleStalled} onSuspend={handleProgress} onError={()=>{clearStallTimer();setErrorText('Mất kết nối âm thanh.');recover()}} onEnded={onEnded}/><button className="mobile-expand" onClick={()=>setFull(true)} aria-label="Mở trình phát đầy đủ"></button>{core}{errorText?<div className="player-error"><span>{errorText}</span><button onClick={retry}>Thử lại</button></div>:null}</div>
+    {full&&<div className="full-player"><div className="full-head"><button onClick={()=>setFull(false)} aria-label="Thu nhỏ trình phát"><ChevronDown/></button><span>{isMusic?'ĐANG PHÁT NHẠC':'ĐANG PHÁT PODCAST'}</span><button aria-label="Tùy chọn khác" disabled><MoreHorizontal/></button></div><div className="full-cover">{cover?<img src={cover} alt=""/>:<div className="full-cover-fallback">{isMusic?<Disc3 size={72}/>:<Headphones size={72}/>}</div>}</div>{core}{queueOpen&&!isMusic&&<QueuePanel queue={queue} episodes={episodes} podcastById={podcastById} onPlay={onPlayEpisode} setQueue={setQueue}/>}</div>}
   </>
 }
 

@@ -1,4 +1,4 @@
-const CACHE='podcast-vault-community-v2'
+const CACHE='podcast-vault-community-v3'
 const SHELL=['/','/manifest.webmanifest','/icon.svg']
 
 self.addEventListener('install',event=>{
@@ -12,12 +12,14 @@ self.addEventListener('activate',event=>{
 self.addEventListener('fetch',event=>{
   if(event.request.method!=='GET')return
   const url=new URL(event.request.url)
-  if(event.request.destination==='audio'||url.origin!==self.location.origin)return
+  // Never intercept byte-range/media requests. Let the browser and origin keep
+  // the native 206/Content-Range streaming contract intact.
+  if(event.request.headers.has('range')||event.request.destination==='audio'||url.origin!==self.location.origin)return
   if(event.request.mode==='navigate'){
     event.respondWith(fetch(event.request).catch(()=>caches.match('/')))
     return
   }
   event.respondWith(caches.match(event.request).then(cached=>cached||fetch(event.request).then(res=>{
-    const copy=res.clone();caches.open(CACHE).then(c=>c.put(event.request,copy));return res
+    if(res.ok){const copy=res.clone();caches.open(CACHE).then(c=>c.put(event.request,copy))}return res
   })))
 })
