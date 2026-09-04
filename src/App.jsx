@@ -355,6 +355,8 @@ export default function App(){
     if(activePlayer==='music'&&currentTrackId===id)setPlayRequest(v=>v+1)
     else{setCurrentTrackId(id);setActivePlayer('music')}
   }
+  const musicTarget=item=>item?{key:`music:${item.id}`,type:'music',id:item.id,src:item.audio_url,title:item.title,subtitle:item.artist||'Unknown artist',cover:item.cover_url,album:item.album||'Âm nhạc'}:null
+  const podcastTarget=item=>{const show=item?podcastById[item.podcast_id]:null;return item?{key:`podcast:${item.id}`,type:'podcast',id:item.id,src:item.audio_url,title:item.title,subtitle:show?.title||'Podcast',cover:show?.image||show?.cover_url,album:'Podcast'}:null}
   const nextTrack=(wrap=true)=>{
     if(!tracks.length)return
     const idx=tracks.findIndex(t=>t.id===currentTrackId)
@@ -362,7 +364,7 @@ export default function App(){
     const next=after||(wrap?tracks.slice(0,Math.max(0,idx+1)).find(t=>t.audio_url):null)
     if(!next)return false
     playTrack(next.id)
-    return true
+    return musicTarget(next)
   }
   const previousTrack=(wrap=true)=>{
     if(!tracks.length)return
@@ -371,7 +373,7 @@ export default function App(){
     const prev=before||(wrap?tracks.slice(Math.max(0,idx+1)).reverse().find(t=>t.audio_url):null)
     if(!prev)return false
     playTrack(prev.id)
-    return true
+    return musicTarget(prev)
   }
   const openPodcast=id=>{
     if(!id)return
@@ -409,7 +411,7 @@ export default function App(){
     if(idx===0&&!wrap)return false
     const prev=idx>0?same[idx-1]:same[same.length-1]
     if(prev)playEpisode(prev.id)
-    return Boolean(prev)
+    return podcastTarget(prev)
   }
 
   const nextEpisode=(wrap=true)=>{
@@ -418,7 +420,8 @@ export default function App(){
       const nextIndex=queue.findIndex(id=>episodes.some(e=>e.id===id&&e.audio_url))
       if(nextIndex>=0){
         const next=queue[nextIndex]
-        setQueue(queue.slice(nextIndex+1));playEpisode(next);return true
+        const item=episodes.find(e=>e.id===next)
+        setQueue(queue.slice(nextIndex+1));playEpisode(next);return podcastTarget(item)
       }
       setQueue([])
     }
@@ -428,7 +431,7 @@ export default function App(){
       const idx=same.findIndex(e=>e.id===current.id)
       const next=idx>=0&&same[idx+1]?same[idx+1]:(wrap?same[0]:null)
       if(next)playEpisode(next.id)
-      return Boolean(next)
+      return podcastTarget(next)
     }
     return false
   }
@@ -775,6 +778,7 @@ function UnifiedPlayer({mediaType,episode,podcast,track,tracks,saved,onProgress,
   const preloadAbortRef=useRef(null)
   const preloadedSrcRef=useRef('')
   const loadedSourceKeyRef=useRef('')
+  const imperativeTransitionRef=useRef(null)
   const [playing,setPlaying]=useState(false)
   const [time,setTime]=useState(0)
   const [duration,setDuration]=useState(0)
@@ -849,27 +853,60 @@ function UnifiedPlayer({mediaType,episode,podcast,track,tracks,saved,onProgress,
     if(!capture.isMusic&&capture.episode)onProgress?.(capture.episode,capture.position,capture.duration,capture.duration>0&&capture.position/capture.duration>.95)
   }
 
+  const startResolvedTarget=target=>{
+    const a=audioRef.current
+    if(!a||!target?.src||!target?.key)return false
+    clearTimeout(stallTimerRef.current)
+    clearTimeout(recoveryTimerRef.current)
+    if(recoveryMetadataHandlerRef.current){a.removeEventListener('loadedmetadata',recoveryMetadataHandlerRef.current);recoveryMetadataHandlerRef.current=null}
+    const normalizedSrc=new URL(target.src,window.location.href).href
+    const sourceChanged=a.currentSrc!==normalizedSrc&&a.src!==normalizedSrc
+    const generation=++sourceGenerationRef.current
+    imperativeTransitionRef.current={key:target.key,src:normalizedSrc,generation,resume:0}
+    mediaKeyRef.current=target.key
+    switchingRef.current=true
+    playIntentRef.current=true
+    wasPlayingRef.current=true
+    retryRef.current=0
+    setBuffering(true);setErrorText('')
+    try{
+      if('mediaSession' in navigator)navigator.mediaSession.metadata=new MediaMetadata({title:target.title||'Đang phát',artist:target.subtitle||'Podcast Vault',album:target.album||'Podcast Vault',artwork:target.cover?[{src:target.cover,sizes:'512x512'}]:[]})
+    }catch{}
+    if(sourceChanged){a.src=target.src;a.preload='auto';a.load()}
+    else if(a.ended||a.currentTime>0)a.currentTime=0
+    a.play().catch(error=>{
+      if(sourceGenerationRef.current!==generation||mediaKeyRef.current!==target.key)return
+      setPlaying(false)
+      if(error?.name==='NotAllowedError'){playIntentRef.current=false;wasPlayingRef.current=false;setBuffering(false);setErrorText('Android đã chặn tự phát trong nền. Mở ứng dụng và bấm Play.')}
+      else{setBuffering(true);setErrorText('Đang chờ audio tiếp theo sẵn sàng…')}
+    })
+    return true
+  }
+
   useLayoutEffect(()=>{
     const a=audioRef.current
     if(!a||!src||!key)return
+    const normalizedSrc=new URL(src,window.location.href).href
+    const imperative=imperativeTransitionRef.current
+    const handedOff=imperative?.key===key&&imperative.src===normalizedSrc
     switchingRef.current=true
-    const generation=++sourceGenerationRef.current
+    const generation=handedOff?imperative.generation:++sourceGenerationRef.current
     endedHandledRef.current=false
     endedCommitKeyRef.current=''
     retryRef.current=0
     listenBufferRef.current=0
     setErrorText('');setBuffering(true)
-    a.pause()
+    if(!handedOff)a.pause()
     mediaKeyRef.current=key
     const local=readLocal(),snapshot=local.playbackSnapshot
     const localResume=Number(local.mediaPositions?.[key]||0)
     const remoteResume=!isMusic?Number(saved?.current_time||0):0
     const localIsNewer=snapshot?.key===key&&new Date(snapshot.updated_at||0).getTime()>=new Date(saved?.last_listened_at||0).getTime()
-    const resume=!isMusic?(localIsNewer?Number(snapshot.currentTime||localResume):(saved?.last_listened_at?remoteResume:localResume)):localResume
+    const resume=handedOff?imperative.resume:!isMusic?(localIsNewer?Number(snapshot.currentTime||localResume):(saved?.last_listened_at?remoteResume:localResume)):localResume
     const previousSourceKey=loadedSourceKeyRef.current
     const isInitialSource=!previousSourceKey
     const mediaChanged=Boolean(previousSourceKey&&previousSourceKey!==key)
-    const shouldAutoPlay=mediaChanged?true:isInitialSource?(snapshot?.key===key?snapshot.playing!==false:true):playIntentRef.current
+    const shouldAutoPlay=handedOff||mediaChanged?true:isInitialSource?(snapshot?.key===key?snapshot.playing!==false:true):playIntentRef.current
     loadedSourceKeyRef.current=key
     lastTimeRef.current=resume
     lastTimeEventRef.current=performance.now()
@@ -883,7 +920,6 @@ function UnifiedPlayer({mediaType,episode,podcast,track,tracks,saved,onProgress,
       setBuffering(false)
       switchingRef.current=false
     }
-    const normalizedSrc=new URL(src,window.location.href).href
     const sourceChanged=a.currentSrc!==normalizedSrc&&a.src!==normalizedSrc
     if(sourceChanged){a.addEventListener('loadedmetadata',ready,{once:true});a.src=src}
     else if(a.readyState>=HTMLMediaElement.HAVE_METADATA)ready()
@@ -893,7 +929,9 @@ function UnifiedPlayer({mediaType,episode,podcast,track,tracks,saved,onProgress,
     if(sourceChanged)a.load()
     // Start fetching/playing immediately. Waiting for all metadata first can make
     // large MP3/M4A files feel slow, especially when the server has a cold cache.
-    if(shouldAutoPlay){wasPlayingRef.current=true;playIntentRef.current=true;a.play().then(()=>{
+    imperativeTransitionRef.current=null
+    if(shouldAutoPlay&&handedOff){wasPlayingRef.current=true;playIntentRef.current=true}
+    else if(shouldAutoPlay){wasPlayingRef.current=true;playIntentRef.current=true;a.play().then(()=>{
       if(generation!==sourceGenerationRef.current||mediaKeyRef.current!==key)return
       setPlaying(true);wasPlayingRef.current=true
       if(!isMusic&&episode)onHistory?.(episode)
@@ -926,8 +964,8 @@ function UnifiedPlayer({mediaType,episode,podcast,track,tracks,saved,onProgress,
     }catch{}
     setHandler('play',()=>{const a=audioRef.current;if(!a)return;playIntentRef.current=true;wasPlayingRef.current=true;a.play().catch(()=>{playIntentRef.current=false;wasPlayingRef.current=false;setErrorText('Không phát được file âm thanh.')})})
     setHandler('pause',()=>{playIntentRef.current=false;wasPlayingRef.current=false;audioRef.current?.pause()})
-    setHandler('previoustrack',()=>{const a=audioRef.current;if(a?.currentTime>5){a.currentTime=0;lastTimeRef.current=0;lastTimeEventRef.current=performance.now();setTime(0)}else{const nav=navigationRef.current;nav.prevHandler?.(nav.repeatMode==='all')}})
-    setHandler('nexttrack',()=>{const nav=navigationRef.current;nav.nextHandler?.(nav.repeatMode==='all')})
+    setHandler('previoustrack',()=>{const a=audioRef.current;if(a?.currentTime>5){a.currentTime=0;lastTimeRef.current=0;lastTimeEventRef.current=performance.now();setTime(0)}else{const nav=navigationRef.current;transitionWithHandler(nav.prevHandler,nav.repeatMode==='all')}})
+    setHandler('nexttrack',()=>{const nav=navigationRef.current;transitionWithHandler(nav.nextHandler,nav.repeatMode==='all')})
     setHandler('seekbackward',d=>{const a=audioRef.current;if(a){a.currentTime=Math.max(0,a.currentTime-(d.seekOffset||15));lastTimeRef.current=a.currentTime;lastTimeEventRef.current=performance.now()}})
     setHandler('seekforward',d=>{const a=audioRef.current;if(a){a.currentTime=Math.min(a.duration||Infinity,a.currentTime+(d.seekOffset||30));lastTimeRef.current=a.currentTime;lastTimeEventRef.current=performance.now()}})
     setHandler('seekto',d=>{const a=audioRef.current;if(a&&Number.isFinite(d.seekTime)){a.currentTime=Math.max(0,Math.min(a.duration||Infinity,d.seekTime));lastTimeRef.current=a.currentTime;lastTimeEventRef.current=performance.now()}})
@@ -1024,6 +1062,15 @@ function UnifiedPlayer({mediaType,episode,podcast,track,tracks,saved,onProgress,
   const seek=e=>{const a=audioRef.current;if(a){a.currentTime=Number(e.target.value);lastTimeRef.current=a.currentTime;lastTimeEventRef.current=performance.now()}}
   const cycleRepeat=()=>setRepeatMode(m=>m==='off'?'all':m==='all'?'one':'off')
   const cyclePlaybackRate=()=>setPlaybackRate(rate=>rate>=2?0.75:rate<1?1:rate<1.25?1.25:rate<1.5?1.5:2)
+  const transitionWithHandler=(handler,wrap)=>{
+    const target=handler?.(wrap)
+    if(!target)return false
+    const capture=capturePlayback()
+    endedCommitKeyRef.current=key
+    const started=startResolvedTarget(target)
+    deferTask(()=>commitCaptured(capture,{snapshot:false}))
+    return started
+  }
   const onEnded=()=>{
     if(endedHandledRef.current)return
     endedHandledRef.current=true
@@ -1033,21 +1080,22 @@ function UnifiedPlayer({mediaType,episode,podcast,track,tracks,saved,onProgress,
     if('mediaSession' in navigator)navigator.mediaSession.playbackState='paused'
     const a=audioRef.current
     const hasQueuedEpisode=!isMusic&&(queue||[]).some(id=>(episodes||[]).some(item=>item.id===id&&item.audio_url))
-    if(hasQueuedEpisode){nextHandler?.(false);deferTask(()=>commitCaptured(capture,{snapshot:false}));return}
+    if(hasQueuedEpisode){const target=nextHandler?.(false);startResolvedTarget(target);deferTask(()=>commitCaptured(capture,{snapshot:false}));return}
     const hasAlternative=isMusic?(tracks||[]).some(item=>item.id!==mediaId&&item.audio_url):(episodes||[]).some(item=>item.id!==mediaId&&item.podcast_id===episode?.podcast_id&&item.audio_url)
     if((repeatMode==='one'||(repeatMode==='all'&&!hasAlternative))&&a){a.currentTime=0;lastTimeRef.current=0;lastTimeEventRef.current=performance.now();playIntentRef.current=true;wasPlayingRef.current=true;a.play().catch(()=>{playIntentRef.current=false;wasPlayingRef.current=false;setErrorText('Không thể phát lại.')});deferTask(()=>commitCaptured(capture,{playing:true}));return}
-    const transitioned=Boolean(nextHandler?.(repeatMode==='all'))
+    const target=nextHandler?.(repeatMode==='all')
+    const transitioned=startResolvedTarget(target)
     deferTask(()=>commitCaptured(capture,{snapshot:!transitioned,playing:false}))
     if(!transitioned&&a)setTime(a.duration||time)
   }
-  const previous=()=>{const a=audioRef.current;if(!a)return;if(a.currentTime>5){a.currentTime=0;lastTimeRef.current=0;setTime(0);persistPosition();return}prevHandler?.(repeatMode==='all')}
+  const previous=()=>{const a=audioRef.current;if(!a)return;if(a.currentTime>5){a.currentTime=0;lastTimeRef.current=0;setTime(0);persistPosition();return}transitionWithHandler(prevHandler,repeatMode==='all')}
   const retry=()=>{retryRef.current=0;wasPlayingRef.current=true;recover()}
 
   if(!media)return <div className="player"><div className="player-placeholder"><Headphones size={18}/> Chưa có nội dung đang phát.</div></div>
 
   const core=<>
     <div className="now unified-now"><div className="music-now-cover">{cover?<img src={cover} alt=""/>:(isMusic?<Disc3 size={22}/>:<Headphones size={22}/>)}</div><div><span className={`now-type ${isMusic?'music-type':'podcast-type'}`}>{isMusic?<Music2 size={12}/>:<Headphones size={12}/>} {isMusic?'ÂM NHẠC':'PODCAST'}</span><strong>{title}</strong><span className="music-artist">{subtitle}</span></div>{buffering?<LoaderCircle className="buffer-spin" size={18}/>:null}</div>
-    <div className="controls"><div className="control-row music-main-controls"><button title="Trước" onClick={previous}><SkipBack size={21}/></button><button className="play-main" onClick={toggle}>{playing?<Pause fill="currentColor"/>:<Play fill="currentColor"/>}</button><button title="Tiếp" onClick={()=>nextHandler?.(repeatMode==='all')}><SkipForward size={21}/></button></div><div className="timeline"><span>{fmt(time)}</span><input type="range" min="0" max={duration||1} value={Math.min(time,duration||1)} onChange={seek}/><span>{fmt(duration)}</span></div></div>
+    <div className="controls"><div className="control-row music-main-controls"><button title="Trước" onClick={previous}><SkipBack size={21}/></button><button className="play-main" onClick={toggle}>{playing?<Pause fill="currentColor"/>:<Play fill="currentColor"/>}</button><button title="Tiếp" onClick={()=>transitionWithHandler(nextHandler,repeatMode==='all')}><SkipForward size={21}/></button></div><div className="timeline"><span>{fmt(time)}</span><input type="range" min="0" max={duration||1} value={Math.min(time,duration||1)} onChange={seek}/><span>{fmt(duration)}</span></div></div>
     <div className="extras"><button title="Tua lại" onClick={()=>seekBy(isMusic?-10:-15)}><RotateCcw size={17}/></button>{!isMusic&&<button className="speed-btn" title="Tốc độ phát" onClick={cyclePlaybackRate}>{playbackRate}×</button>}<button className={`repeat-btn ${repeatMode!=='off'?'active':''}`} title={repeatMode==='off'?'Lặp: Tắt':repeatMode==='all'?'Lặp tất cả':'Lặp 1 bài/tập'} onClick={cycleRepeat}><Repeat2 size={18}/>{repeatMode==='one'?<span className="repeat-one">1</span>:null}</button>{!isMusic&&<button className="queue-toggle" title="Queue" onClick={()=>setQueueOpen(v=>!v)}><ListMusic size={18}/></button>}<Volume2 size={17}/><input className="volume" type="range" min="0" max="1" step=".05" value={volume} onChange={e=>setVolume(Number(e.target.value))}/></div>
   </>
   return <><div className="player unified-player"><audio ref={audioRef} playsInline preload="auto" onLoadStart={()=>setBuffering(true)} onLoadedMetadata={()=>setDuration(audioRef.current?.duration||Number(media?.duration)||0)} onTimeUpdate={handleTime} onProgress={handleProgress} onPlay={()=>{setPlaying(true);wasPlayingRef.current=true;if('mediaSession' in navigator)navigator.mediaSession.playbackState='playing'}} onPlaying={handlePlaying} onPause={()=>{setPlaying(false);if(!switchingRef.current){flushListening();persistPosition()}if('mediaSession' in navigator)navigator.mediaSession.playbackState='paused'}} onWaiting={handleWaiting} onCanPlay={handleCanPlay} onCanPlayThrough={handleCanPlay} onStalled={handleStalled} onSuspend={handleProgress} onError={()=>{clearStallTimer();setErrorText('Mất kết nối âm thanh.');recover()}} onEnded={onEnded}/><button className="mobile-expand" onClick={()=>setFull(true)} aria-label="Mở trình phát đầy đủ"></button>{core}{errorText?<div className="player-error"><span>{errorText}</span><button onClick={retry}>Thử lại</button></div>:null}</div>
